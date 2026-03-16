@@ -155,6 +155,270 @@ def _render_with_remotion(
                 pass
 
 
+def render_image_scene(
+    image_path: Path,
+    output_path: Path,
+    duration_seconds: float = 5.0,
+    fps: int = 30,
+    niche: str = "general",
+    orientation: str | None = None,
+) -> bool:
+    """Render an animated image scene video using Remotion.
+
+    Creates a video with:
+      - Blurred background image + niche-themed gradient overlay
+      - Centered framed image with entrance/exit animations
+      - Subtle Ken Burns effect
+
+    Args:
+        image_path: Path to the source image file
+        output_path: Where to save the MP4 file
+        duration_seconds: Duration of the video in seconds
+        fps: Frames per second
+        niche: Content niche for gradient theme (cine, tech, historia, etc.)
+        orientation: "horizontal" or "vertical". Auto-detected if None.
+
+    Returns:
+        True if the video was created successfully
+    """
+    image_path = Path(image_path)
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if not image_path.exists():
+        _safe_print(f"[ImageScene] Source image not found: {image_path}")
+        return False
+
+    # Auto-detect orientation and dimensions
+    detected_orient, img_w, img_h = _detect_orientation_and_size(image_path)
+    if orientation is None:
+        orientation = detected_orient
+
+    # Try Remotion first
+    success = _render_image_scene_remotion(
+        image_path, output_path, duration_seconds, fps, niche, orientation,
+        img_w, img_h,
+    )
+    if success:
+        return True
+
+    # Fallback to FFmpeg
+    _safe_print("[ImageScene] Falling back to FFmpeg...")
+    return _render_image_scene_ffmpeg(
+        image_path, output_path, duration_seconds, fps, niche, orientation
+    )
+
+
+def _detect_orientation_and_size(image_path: Path) -> tuple[str, int, int]:
+    """Detect image orientation and dimensions using ffprobe.
+
+    Returns (orientation, width, height). Defaults to ("horizontal", 1920, 1080).
+    """
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "quiet",
+                "-print_format", "json",
+                "-show_streams",
+                str(image_path),
+            ],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            info = json.loads(result.stdout)
+            for stream in info.get("streams", []):
+                w = stream.get("width", 0)
+                h = stream.get("height", 0)
+                if w and h:
+                    orient = "horizontal" if w >= h else "vertical"
+                    _safe_print(f"[ImageScene] Detected {w}x{h} ({orient})")
+                    return orient, w, h
+    except Exception:
+        pass
+    return "horizontal", 1920, 1080
+
+
+def _detect_orientation(image_path: Path) -> str:
+    """Detect whether an image is horizontal or vertical. Compat wrapper."""
+    orient, _, _ = _detect_orientation_and_size(image_path)
+    return orient
+
+
+def _render_image_scene_remotion(
+    image_path: Path,
+    output_path: Path,
+    duration_seconds: float,
+    fps: int,
+    niche: str,
+    orientation: str,
+    image_width: int = 1920,
+    image_height: int = 1080,
+) -> bool:
+    """Render image scene using Remotion CLI."""
+    img_filename = None
+    try:
+        if not (_REMOTION_DIR / "node_modules").exists():
+            _safe_print("[ImageScene] node_modules not found, skipping Remotion")
+            return False
+
+        duration_frames = max(int(duration_seconds * fps), 30)
+
+        # Copy image to remotion/public/
+        public_dir = _REMOTION_DIR / "public"
+        public_dir.mkdir(exist_ok=True)
+        img_filename = f"imgscene_{output_path.stem}{image_path.suffix}"
+        img_dest = public_dir / img_filename
+        shutil.copy2(str(image_path), str(img_dest))
+
+        # Write props (includes image dimensions for aspect-ratio frame adaptation)
+        props = {
+            "imagePath": img_filename,
+            "durationInFrames": duration_frames,
+            "niche": niche,
+            "orientation": orientation,
+            "imageWidth": image_width,
+            "imageHeight": image_height,
+        }
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False, dir=str(_REMOTION_DIR)
+        ) as f:
+            json.dump(props, f)
+            props_path = f.name
+
+        try:
+            cmd = [
+                "npx", "remotion", "render",
+                "src/Root.tsx",
+                "ImageScene",
+                str(output_path.resolve()),
+                f"--props={props_path}",
+                "--codec=h264",
+                "--log=error",
+            ]
+
+            _safe_print(
+                f"[ImageScene] Rendering: {image_path.name} | "
+                f"niche={niche} orient={orientation} "
+                f"({duration_seconds:.1f}s, {duration_frames}f)"
+            )
+
+            result = subprocess.run(
+                cmd,
+                cwd=str(_REMOTION_DIR),
+                capture_output=True,
+                text=True,
+                timeout=180,
+                shell=True,
+            )
+
+            if result.returncode != 0:
+                _safe_print(f"[ImageScene] Remotion error (exit {result.returncode}): {result.stderr[:500]}")
+                return False
+
+            if output_path.exists() and output_path.stat().st_size > 1000:
+                _safe_print(f"[ImageScene] OK: {output_path.name} ({output_path.stat().st_size // 1024}KB)")
+                return True
+
+            _safe_print("[ImageScene] Output file missing or too small")
+            return False
+
+        finally:
+            try:
+                Path(props_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    except subprocess.TimeoutExpired:
+        _safe_print("[ImageScene] Render timed out (180s)")
+        return False
+    except FileNotFoundError:
+        _safe_print("[ImageScene] npx not found")
+        return False
+    except Exception as exc:
+        _safe_print(f"[ImageScene] Error: {exc}")
+        return False
+    finally:
+        if img_filename:
+            try:
+                (_REMOTION_DIR / "public" / img_filename).unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+def _render_image_scene_ffmpeg(
+    image_path: Path,
+    output_path: Path,
+    duration_seconds: float,
+    fps: int,
+    niche: str,
+    orientation: str,
+) -> bool:
+    """Fallback: render animated image scene using FFmpeg with zoom + fade."""
+    try:
+        total_frames = int(duration_seconds * fps)
+        fade_in_frames = min(15, total_frames // 3)
+        fade_out_start = max(0, total_frames - 15)
+
+        # Scale image inside a 1920x1080 frame with blurred background
+        if orientation == "vertical":
+            # Vertical: image centered, blurred bg behind
+            vf = (
+                f"split[bg][fg];"
+                f"[bg]scale=1920:1080:force_original_aspect_ratio=increase,"
+                f"crop=1920:1080,gblur=sigma=40,colorbalance=bs=-.1[bgout];"
+                f"[fg]scale=-2:900[fgout];"
+                f"[bgout][fgout]overlay=(W-w)/2:(H-h)/2,"
+                f"zoompan=z='min(zoom+0.0003,1.04)':d={total_frames}:s=1920x1080:fps={fps},"
+                f"fade=t=in:st=0:d={fade_in_frames / fps},"
+                f"fade=t=out:st={fade_out_start / fps}:d={15 / fps}"
+            )
+        else:
+            # Horizontal: image fills most of frame, blurred bg
+            vf = (
+                f"split[bg][fg];"
+                f"[bg]scale=1920:1080:force_original_aspect_ratio=increase,"
+                f"crop=1920:1080,gblur=sigma=40,colorbalance=bs=-.1[bgout];"
+                f"[fg]scale=1400:-2[fgout];"
+                f"[bgout][fgout]overlay=(W-w)/2:(H-h)/2,"
+                f"zoompan=z='min(zoom+0.0003,1.04)':d={total_frames}:s=1920x1080:fps={fps},"
+                f"fade=t=in:st=0:d={fade_in_frames / fps},"
+                f"fade=t=out:st={fade_out_start / fps}:d={15 / fps}"
+            )
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-loop", "1",
+            "-i", str(image_path),
+            "-t", str(duration_seconds),
+            "-filter_complex", vf,
+            "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",
+            "-preset", "fast",
+            "-crf", "23",
+            "-r", str(fps),
+            str(output_path),
+        ]
+
+        _safe_print(f"[ImageScene/FFmpeg] Rendering: {image_path.name} ({duration_seconds:.1f}s)")
+
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+
+        if result.returncode != 0:
+            _safe_print(f"[ImageScene/FFmpeg] Error: {result.stderr[:300]}")
+            return False
+
+        if output_path.exists() and output_path.stat().st_size > 1000:
+            _safe_print(f"[ImageScene/FFmpeg] OK: {output_path.name}")
+            return True
+
+        return False
+
+    except Exception as exc:
+        _safe_print(f"[ImageScene/FFmpeg] Error: {exc}")
+        return False
+
+
 def _render_with_ffmpeg(
     title_text: str,
     output_path: Path,

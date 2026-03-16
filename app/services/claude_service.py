@@ -6,8 +6,38 @@ import re
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional
-from openai import OpenAI
+from anthropic import Anthropic
 from ..config import settings
+
+
+# ── Numbered entry detection (for countdown/list videos) ─────────────────────
+# Matches: "Number 1,", "Number 10.", "#1 ", "#10:", "10. ", "1. ", etc.
+_RE_NUMBERED = re.compile(
+    r"^\s*(?:Number\s+\d+|#\s*\d+|\d{1,2}\.)\s*[,:.]?\s",
+    re.IGNORECASE,
+)
+# Matches through the title portion (everything up to first period or colon after number+title)
+_RE_TITLE_END = re.compile(
+    r"^\s*(?:Number\s+\d+|#\s*\d+|\d{1,2}\.)\s*[,:.]?\s*[^.:]+[.:]",
+    re.IGNORECASE,
+)
+
+
+def _is_numbered_entry(text: str) -> bool:
+    """Check if text starts with a numbered list pattern (Number X, #X, X.)."""
+    return bool(_RE_NUMBERED.match(text))
+
+
+def _find_title_end(text: str) -> int | None:
+    """Find where a numbered entry's title ends (first . or : after the title phrase).
+
+    Returns the character index right after the title-ending punctuation,
+    or None if no clear title boundary is found.
+    """
+    m = _RE_TITLE_END.match(text)
+    if m and len(text) > m.end() and text[m.end():].strip():
+        return m.end()
+    return None
 
 
 def _safe_print(msg: str) -> None:
@@ -18,11 +48,10 @@ def _safe_print(msg: str) -> None:
     except Exception:
         pass
 
-# OpenRouter is OpenAI-compatible — just swap the base_url and api_key
-client = OpenAI(
-    api_key=settings.openrouter_api_key,
-    base_url="https://openrouter.ai/api/v1",
-)
+# Using Anthropic SDK for direct API access
+client = Anthropic(api_key=settings.anthropic_api_key)
+
+# Removed: Anthropic direct client (no credits)
 
 # Model aliases
 _MODEL_FAST  = "google/gemini-2.0-flash-lite-001"  # cheap + fast (JSON tasks, image prompts)
@@ -31,7 +60,7 @@ _MODEL_SMART = "google/gemini-2.0-flash-001"        # quality (scripts, editing)
 
 def _chat(system: str, user: str, model: str = _MODEL_SMART, max_tokens: int = 8192) -> str:
     """Call OpenRouter with a system + user message. Returns the text response."""
-    resp = client.chat.completions.create(
+    resp = client.messages.create(
         model=model,
         max_tokens=max_tokens,
         messages=[
@@ -345,7 +374,7 @@ def generate_script_from_outline(outline: str, duration: str = "6-8") -> str:
 
 # ── Scene division with SRT timestamps ───────────────────────────────────────
 
-_MODEL_HAIKU = "anthropic/claude-haiku-4.5"
+_MODEL_SCENE_DIVISION = "claude-sonnet-4-5"  # Sonnet via OpenRouter
 _SCENE_CHUNK_WORDS = 3000  # split script into chunks of this many words for long videos
 
 
@@ -460,6 +489,9 @@ def divide_script_into_scenes(_script_text: str, srt_content: str, mode: str = "
             block_scenes = _map_scenes_to_timestamps(block_scene_texts, block_word_ts)
             all_scenes.extend(block_scenes)
 
+    # ── Final repair: fix numbered entries split across SRT blocks ─────
+    all_scenes = _repair_numbered_scenes(all_scenes)
+
     # Renumber IDs sequentially
     for idx, s in enumerate(all_scenes, 1):
         s["id"] = idx
@@ -469,6 +501,73 @@ def divide_script_into_scenes(_script_text: str, srt_content: str, mode: str = "
 
     _safe_print(f"[SceneDivision] Total: {len(all_scenes)} escenas.")
     return all_scenes
+
+
+def _repair_numbered_scenes(scenes: list) -> list:
+    """Post-process pass: fix numbered entries that were split across SRT blocks.
+
+    Detects two cases:
+    1. Numbered entry ends with a hanging word (preposition/article):
+       "Number 1, The Rock's entrance into" → merge next scene
+    2. Numbered entry has NO title boundary (no colon/period after title):
+       "Number 5, The Train" → merge next scene until we find ":"/"."
+
+    Merges subsequent scenes until the title is complete.
+    """
+    if len(scenes) < 2:
+        return scenes
+
+    # Pattern: ends with a preposition, article, or connector
+    _HANGING_ENDS = re.compile(
+        r"\b(?:into|of|the|a|an|in|on|at|to|for|with|from|by|and|or|but|that|which|was|were|is|are|vs)\s*[.:]?\s*$",
+        re.IGNORECASE,
+    )
+
+    result = []
+    i = 0
+    repairs = 0
+    while i < len(scenes):
+        scene = dict(scenes[i])  # copy
+
+        if _is_numbered_entry(scene["texto"]):
+            needs_repair = False
+
+            # Case 1: text ends with a hanging word
+            if _HANGING_ENDS.search(scene["texto"]):
+                needs_repair = True
+
+            # Case 2: no title boundary found (no : or . after the number+title)
+            # This means the title was cut short: "Number 5, The Train"
+            if not needs_repair and _find_title_end(scene["texto"]) is None:
+                # Check if the text is short (likely an incomplete title)
+                word_count = len(scene["texto"].split())
+                if word_count < 12:  # Short numbered entry without boundary = likely incomplete
+                    needs_repair = True
+
+            if needs_repair:
+                merge_count = 0
+                while i + 1 < len(scenes) and merge_count < 4:
+                    next_scene = scenes[i + 1]
+                    # Don't merge into another numbered entry
+                    if _is_numbered_entry(next_scene["texto"]):
+                        break
+                    merged_text = scene["texto"].rstrip() + " " + next_scene["texto"].lstrip()
+                    scene["texto"] = merged_text
+                    scene["endMs"] = next_scene["endMs"]
+                    i += 1
+                    merge_count += 1
+                    repairs += 1
+                    # Stop merging once we find a title boundary (colon/period)
+                    if _find_title_end(merged_text) is not None:
+                        break
+
+        result.append(scene)
+        i += 1
+
+    if repairs > 0:
+        _safe_print(f"[SceneDivision] Repaired {repairs} split numbered entries")
+
+    return result
 
 
 def _parse_srt_entries_full(srt_text: str) -> list:
@@ -511,60 +610,88 @@ def _build_word_timestamps(entries: list) -> list:
 
 def _divide_text_with_haiku(full_text: str, total_duration_s: float, wps: float,
                             mode: str = "animated") -> list:
-    """Send continuous narration text to Claude Haiku. Returns list of scene text strings."""
+    """Send continuous narration text to Claude Sonnet (Anthropic direct). Returns list of scene text strings."""
     total_words = len(full_text.split())
-    print(f"[_divide_text_with_haiku] mode={mode}, words={total_words}, dur={total_duration_s:.1f}s")
-    print(f"[_divide_text_with_haiku] STOCK PROMPT: {'YES' if mode == 'stock' else 'NO (animated)'}")
+    print(f"[SceneDivision] model={_MODEL_SCENE_DIVISION} (Anthropic direct), mode={mode}, words={total_words}, dur={total_duration_s:.1f}s")
+    print(f"[SceneDivision] STOCK PROMPT: {'YES' if mode == 'stock' else 'NO (animated)'}")
+
+    target_min_s = 4
+    target_max_s = 7
+    words_min = max(3, int(target_min_s * wps))
+    words_max = int(target_max_s * wps)
 
     system_prompt = (
-        "Eres un editor de video profesional. Dividís texto narrado en escenas visuales. "
-        "Devolvé SOLO un JSON array de strings con el texto de cada escena. "
-        "Sin markdown, sin explicación, sin texto extra."
+        "You are a professional video editor with 20 years of experience cutting documentaries and YouTube videos. "
+        "Your job is to divide narration scripts into visual scenes for stock footage videos. "
+        "You think carefully about EVERY cut before deciding where to place it. "
+        "Return ONLY a JSON array of strings with the text of each scene. "
+        "No markdown, no explanation, no extra text."
     )
 
     if mode == "stock":
         user_prompt = (
-            f"Dividí este texto en escenas visuales para un video.\n\n"
-            f"TEXTO COMPLETO:\n{full_text}\n\n"
-            f"DURACIÓN TOTAL: {total_duration_s:.1f}s\n"
-            f"TOTAL PALABRAS: {total_words}\n"
-            f"VELOCIDAD: {wps:.1f} palabras por segundo\n\n"
-            "Cada escena debe ser UNA idea visual que pueda representarse con una sola imagen o video.\n\n"
-            "=== REGLAS ===\n"
-            "1. Cada escena debe tener sentido completo por sí sola como imagen visual.\n"
-            "2. Cortá en comas, puntos, punto y coma, o cualquier pausa natural donde cambie la imagen mental.\n"
-            "3. NUNCA cortes a mitad de una idea. Si decís 'we're talking about' la siguiente parte "
-            "DEBE estar en la misma escena o la escena no tiene sentido visual.\n"
-            "4. NUNCA termines una escena en preposición (about, of, to, for, in, on, with) o "
-            "conjunción (and, or, that, which) sin completar la idea.\n"
-            "5. Cada escena debe poder responderse: ¿qué imagen pondrías aquí? "
-            "Si no podés imaginar una imagen clara para la escena, está mal cortada.\n"
-            "6. Duración ideal: 2-6 segundos por escena. Máximo absoluto: 10 segundos.\n"
-            f"   (A {wps:.1f} palabras/segundo, 2s = ~{int(2 * wps)} palabras, 6s = ~{int(6 * wps)} palabras)\n"
-            "7. No hay mínimo estricto de palabras. Una escena de 3 palabras es válida si tiene "
-            "sentido visual completo.\n\n"
-            "=== EJEMPLO ===\n"
-            "Texto: \"Phoenix, Arizona, a desert city, is experiencing an economic transformation "
-            "unlike anything seen in the US in decades. We're not just talking about a few new "
-            "buildings; we're talking about a $200 billion boom driven by semiconductor factories, "
-            "data centers, and urban revitalization.\"\n\n"
-            "BIEN dividido:\n"
+            f"Divide this narration script into visual scenes for a stock footage video.\n\n"
+            f"FULL SCRIPT:\n{full_text}\n\n"
+            f"TOTAL DURATION: {total_duration_s:.1f}s\n"
+            f"TOTAL WORDS: {total_words}\n"
+            f"SPEAKING RATE: {wps:.2f} words per second\n\n"
+            f"=== SCENE DURATION TARGET ===\n"
+            f"- TARGET: {target_min_s}-{target_max_s} seconds per scene\n"
+            f"- At {wps:.2f} words/sec → {words_min}-{words_max} words per scene\n"
+            f"- HARD MAXIMUM: {target_max_s} seconds. A scene MUST NOT exceed {words_max} words.\n"
+            f"- MINIMUM: {target_min_s} seconds. Do NOT create scenes shorter than {words_min} words unless absolutely necessary.\n\n"
+            "=== HOW TO THINK ABOUT CUTS (THINK LIKE A VIDEO EDITOR) ===\n"
+            "Before deciding where to cut, ask yourself:\n"
+            "1. What IMAGE would I put on screen for this text?\n"
+            "2. Does the cut happen at a natural pause (comma, period, semicolon)?\n"
+            "3. Is the idea visually COMPLETE at this cut point?\n"
+            "4. Would a viewer understand the scene without seeing the next one?\n\n"
+            "A GOOD CUT happens when:\n"
+            "- The narration completes a visual idea (a subject + what it does/is)\n"
+            "- There's natural punctuation (period, comma, semicolon, colon)\n"
+            "- The next sentence introduces a NEW visual idea\n\n"
+            "A BAD CUT happens when:\n"
+            "- The sentence is broken mid-idea ('the decision was' → no image possible)\n"
+            "- The scene ends with a preposition (about, of, to, for, in, on, with, by)\n"
+            "- The scene ends with a conjunction (and, or, but, that, which, who)\n"
+            "- The scene ends with an article (a, an, the)\n"
+            "- Two different visual concepts are crammed into one long scene\n\n"
+            "=== CUTTING STRATEGY ===\n"
+            "Step 1: Read the entire script first to understand its structure.\n"
+            "Step 2: Identify all hard cut points (numbered list items, major topic changes, intro/outro).\n"
+            "Step 3: For each section between hard cuts, divide into 4-7 second visual chunks.\n"
+            "Step 4: Verify every scene has a clear visual identity — if you can't picture a stock clip for it, the cut is wrong.\n\n"
+            "=== CRITICAL RULE FOR NUMBERED LISTS/COUNTDOWN ===\n"
+            "If the script contains list numbers (Number 1, Number 2, Fact #10, #9, etc.):\n"
+            "- EVERY NUMBER is a MANDATORY HARD CUT. The previous scene MUST end before the number begins.\n"
+            "- The number title MUST be in the same scene as the number. NEVER separate them.\n"
+            "- CORRECT: \"Number 3, The Brazilian Setting That Was Never Brazil:\"\n"
+            "- WRONG: \"Number 3,\" then \"The Brazilian Setting That Was Never Brazil:\"\n"
+            "- After the title scene, divide the content into 4-7 second scenes normally.\n\n"
+            "=== EXAMPLE ===\n"
+            f"Speaking rate: {wps:.2f} words/sec → 4s ≈ {int(4*wps)} words, 7s ≈ {int(7*wps)} words\n\n"
+            "Script: \"Fast Five, released in 2011, is arguably the most pivotal movie in the Fast and Furious franchise, "
+            "revitalizing what was once a series about street racing into a full-blown heist thriller. "
+            "Directed by Justin Lin, the film brought together almost every major character from the previous installments "
+            "and introduced Dwayne Johnson as DSS agent Luke Hobbs.\"\n\n"
+            "CORRECT cuts:\n"
             "[\n"
-            '  "Phoenix, Arizona, a desert city,",\n'
-            '  "is experiencing an economic transformation unlike anything seen in the US in decades.",\n'
-            '  "We\'re not just talking about a few new buildings;",\n'
-            '  "we\'re talking about a $200 billion boom",\n'
-            '  "driven by semiconductor factories, data centers, and urban revitalization."\n'
+            '  "Fast Five, released in 2011,",\n'
+            '  "is arguably the most pivotal movie in the Fast and Furious franchise,",\n'
+            '  "revitalizing what was once a series about street racing",\n'
+            '  "into a full-blown heist thriller.",\n'
+            '  "Directed by Justin Lin,",\n'
+            '  "the film brought together almost every major character from the previous installments",\n'
+            '  "and introduced Dwayne Johnson as DSS agent Luke Hobbs."\n'
             "]\n\n"
-            "MAL dividido:\n"
-            '- "is experiencing an economic" ← cortado a mitad de idea, no hay imagen posible\n'
-            '- "a $200 billion boom driven by semiconductor factories, data centers, and urban '
-            'revitalization. This could make Phoenix the most important" ← dos ideas distintas mezcladas\n'
-            '- "or a cautionary tale of" ← preposición colgando sin completar la idea\n\n'
+            "WRONG cuts:\n"
+            '- "is arguably the most pivotal movie in the" ← ends with preposition, incomplete idea\n'
+            '- "Fast Five, released in 2011, is arguably the most pivotal movie in the Fast and Furious franchise, revitalizing what was once a series about street racing into a full-blown heist thriller." ← WAY too long (>{words_max} words)\n'
+            '- "the" ← meaningless fragment\n\n'
             "=== OUTPUT ===\n"
-            "Devolvé SOLO el JSON array de strings. "
-            "Todo el texto original debe estar presente, sin omitir ni repetir nada.\n"
-            '[\"texto escena 1\", \"texto escena 2\", ...]'
+            "Return ONLY the JSON array of strings. Every word from the original script must appear exactly once. "
+            "Do not omit, add, or repeat any text.\n"
+            '["scene 1 text", "scene 2 text", ...]'
         )
     else:
         # Animated mode — original prompt
@@ -614,18 +741,18 @@ def _divide_text_with_haiku(full_text: str, total_duration_s: float, wps: float,
 
     # Debug: confirm which prompt is being sent
     _has_visual_rules = "NUNCA termines una escena en preposición" in user_prompt
-    print(f"[_divide_text_with_haiku] Prompt has visual-coherence rules: {_has_visual_rules}")
-    print(f"[_divide_text_with_haiku] Prompt first 300 chars: {user_prompt[:300]}")
+    print(f"[SceneDivision] Prompt has visual-coherence rules: {_has_visual_rules}")
+    print(f"[SceneDivision] Prompt first 300 chars: {user_prompt[:300]}")
 
-    resp = client.chat.completions.create(
-        model=_MODEL_HAIKU,
+    resp = client.messages.create(
+        model=_MODEL_SCENE_DIVISION,
         max_tokens=16000,
+        system=system_prompt,
         messages=[
-            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
     )
-    raw = resp.choices[0].message.content.strip()
+    raw = resp.choices[0].message.content
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
     scenes = json.loads(raw)
@@ -640,9 +767,14 @@ def _postprocess_scenes(scene_texts: list, wps: float, mode: str = "animated") -
     """Post-process scene texts: merge short, split long, validate.
 
     Runs merge→split→merge cycles until all scenes are 4+ words and within max duration.
+    Numbered entries (Number X, #X) get a relaxed max duration to avoid bad splits.
     """
-    MAX_DUR = 10.0 if mode == "stock" else 6.0
+    MAX_DUR = 7.0 if mode == "stock" else 6.0
+    NUMBERED_MAX_DUR = 12.0 if mode == "stock" else 12.0
     min_words = 4
+
+    def _effective_max(text):
+        return NUMBERED_MAX_DUR if _is_numbered_entry(text) else MAX_DUR
 
     scenes = list(scene_texts)
 
@@ -651,12 +783,13 @@ def _postprocess_scenes(scene_texts: list, wps: float, mode: str = "animated") -
         # ── MERGE: absorb any scene with <4 words into its neighbor ──────
         scenes = _merge_short_scenes(scenes, min_words)
 
-        # ── SPLIT: break any scene >6s ───────────────────────────────────
-        scenes = _split_long_scenes(scenes, wps, MAX_DUR, min_words)
+        # ── SPLIT: break any scene exceeding its max duration ────────────
+        scenes = _split_long_scenes(scenes, wps, MAX_DUR, min_words,
+                                    numbered_max_dur=NUMBERED_MAX_DUR)
 
         # ── CHECK: are we done? ──────────────────────────────────────────
         has_short = any(len(t.split()) < min_words for t in scenes)
-        has_long = any(len(t.split()) / wps > MAX_DUR for t in scenes)
+        has_long = any(len(t.split()) / wps > _effective_max(t) for t in scenes)
 
         if not has_short and not has_long:
             break
@@ -664,7 +797,8 @@ def _postprocess_scenes(scene_texts: list, wps: float, mode: str = "animated") -
         # If only long scenes remain that can't be split, stop
         if not has_short and has_long:
             # One more attempt with brute-force splits
-            scenes = _force_split_long_scenes(scenes, wps, MAX_DUR, min_words)
+            scenes = _force_split_long_scenes(scenes, wps, MAX_DUR, min_words,
+                                              numbered_max_dur=NUMBERED_MAX_DUR)
             scenes = _merge_short_scenes(scenes, min_words)
             break
 
@@ -672,17 +806,22 @@ def _postprocess_scenes(scene_texts: list, wps: float, mode: str = "animated") -
     for i, t in enumerate(scenes):
         wc = len(t.split())
         dur = wc / wps
+        eff_max = _effective_max(t)
         if wc < min_words:
             _safe_print(f"[WARNING] Scene {i+1}: {wc} words (< {min_words}): {t[:60]}")
-        if dur > MAX_DUR:
-            _safe_print(f"[WARNING] Scene {i+1}: {dur:.1f}s (> {MAX_DUR}s): {t[:60]}")
+        if dur > eff_max:
+            _safe_print(f"[WARNING] Scene {i+1}: {dur:.1f}s (> {eff_max}s): {t[:60]}")
 
     return scenes
 
 
 def _merge_short_scenes(scenes: list, min_words: int) -> list:
     """Merge any scene with fewer than min_words into its neighbor.
-    Repeats until no short scenes remain."""
+    Repeats until no short scenes remain.
+
+    GUARD: Never merge a short scene INTO a numbered entry (would prepend
+    random text before "Number X..."). In that case, merge into the PREVIOUS scene.
+    """
     for _pass in range(10):
         result = []
         changed = False
@@ -693,6 +832,11 @@ def _merge_short_scenes(scenes: list, min_words: int) -> list:
             if wc < min_words and len(scenes) > 1:
                 changed = True
                 if i + 1 < len(scenes):
+                    # If next scene starts with a numbered entry, merge into previous instead
+                    if _is_numbered_entry(scenes[i + 1]) and result:
+                        result[-1] = result[-1].rstrip() + " " + text.lstrip()
+                        i += 1
+                        continue
                     # Merge into next
                     scenes[i + 1] = text.rstrip() + " " + scenes[i + 1].lstrip()
                     i += 1
@@ -710,14 +854,19 @@ def _merge_short_scenes(scenes: list, min_words: int) -> list:
     return scenes
 
 
-def _split_long_scenes(scenes: list, wps: float, max_dur: float, min_words: int) -> list:
-    """Split scenes exceeding max_dur at natural boundaries. Up to 5 passes."""
+def _split_long_scenes(scenes: list, wps: float, max_dur: float, min_words: int,
+                       numbered_max_dur: float | None = None) -> list:
+    """Split scenes exceeding max_dur at natural boundaries. Up to 5 passes.
+    Numbered entries use numbered_max_dur (relaxed limit) to avoid bad splits."""
+    if numbered_max_dur is None:
+        numbered_max_dur = max_dur
     for _ in range(5):
         result = []
         changed = False
         for text in scenes:
             words = text.split()
-            if len(words) / wps <= max_dur:
+            effective_max = numbered_max_dur if _is_numbered_entry(text) else max_dur
+            if len(words) / wps <= effective_max:
                 result.append(text)
                 continue
             parts = _try_split_scene(text, words, min_words)
@@ -732,12 +881,17 @@ def _split_long_scenes(scenes: list, wps: float, max_dur: float, min_words: int)
     return scenes
 
 
-def _force_split_long_scenes(scenes: list, wps: float, max_dur: float, min_words: int) -> list:
-    """Brute-force split any remaining >max_dur scenes at word midpoint."""
+def _force_split_long_scenes(scenes: list, wps: float, max_dur: float, min_words: int,
+                             numbered_max_dur: float | None = None) -> list:
+    """Brute-force split any remaining >max_dur scenes at word midpoint.
+    For numbered entries, prefer splitting at title boundary over midpoint."""
+    if numbered_max_dur is None:
+        numbered_max_dur = max_dur
     result = []
     for text in scenes:
         words = text.split()
-        if len(words) / wps <= max_dur:
+        effective_max = numbered_max_dur if _is_numbered_entry(text) else max_dur
+        if len(words) / wps <= effective_max:
             result.append(text)
             continue
         # Try smart split first
@@ -745,6 +899,16 @@ def _force_split_long_scenes(scenes: list, wps: float, max_dur: float, min_words
         if parts:
             result.extend(parts)
             continue
+        # For numbered entries: prefer splitting at title boundary
+        if _is_numbered_entry(text):
+            title_end = _find_title_end(text)
+            if title_end is not None:
+                title_part = text[:title_end].strip()
+                detail_part = text[title_end:].strip()
+                if len(title_part.split()) >= min_words and len(detail_part.split()) >= min_words:
+                    result.append(title_part)
+                    result.append(detail_part)
+                    continue
         # Brute force: split at word midpoint
         mid_w = len(words) // 2
         if mid_w >= min_words and (len(words) - mid_w) >= min_words:
@@ -756,8 +920,30 @@ def _force_split_long_scenes(scenes: list, wps: float, max_dur: float, min_words
 
 
 def _try_split_scene(text: str, words: list, min_words: int = 4) -> list | None:
-    """Try to split a scene text at a natural boundary. Returns [left, right] or None."""
+    """Try to split a scene text at a natural boundary. Returns [left, right] or None.
+
+    For numbered entries (Number X, #X), protects the title from being split:
+    splits ONLY at the title boundary (after the colon/period ending the title).
+    """
     mid = len(text) // 2
+
+    # ── Numbered entry protection ──────────────────────────────────────
+    # If this scene starts with a number pattern, ONLY split at the title boundary.
+    # Never split within the title itself ("Number 1, The Rock's entrance into" is WRONG).
+    if _is_numbered_entry(text):
+        title_end = _find_title_end(text)
+        if title_end is not None:
+            title_part = text[:title_end].strip()
+            detail_part = text[title_end:].strip()
+            title_wc = len(title_part.split())
+            detail_wc = len(detail_part.split())
+            if title_wc >= min_words and detail_wc >= min_words:
+                return [title_part, detail_part]
+        # No valid title boundary found, or parts too short — don't split at all.
+        # The relaxed NUMBERED_MAX_DUR in _postprocess_scenes will tolerate this.
+        return None
+
+    # ── Standard split logic (non-numbered scenes) ─────────────────────
 
     # 1. Period nearest to midpoint
     for radius in range(len(text) // 2):
@@ -781,7 +967,8 @@ def _try_split_scene(text: str, words: list, min_words: int = 4) -> list | None:
         return [text[:best_comma + 1].strip(), text[best_comma + 1:].strip()]
 
     # 3. Clause connector nearest to midpoint (30-70%)
-    CONNECTORS = {"y", "que", "pero", "porque", "donde", "cuando", "sino", "ni", "o"}
+    CONNECTORS = {"y", "que", "pero", "porque", "donde", "cuando", "sino", "ni", "o",
+                  "and", "but", "or", "that", "which", "where", "when"}
     mid_w = len(words) // 2
     lo_w, hi_w = int(len(words) * 0.30), int(len(words) * 0.70)
     best_pos, best_dist = None, float("inf")

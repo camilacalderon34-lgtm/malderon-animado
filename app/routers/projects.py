@@ -701,11 +701,30 @@ def update_chunk_asset_type(
     valid_types = ("clip_bank", "stock_video", "title_card", "web_image", "ai_image", "archive_footage", "space_media")
     if payload.asset_type not in valid_types:
         raise HTTPException(status_code=400, detail=f"Tipo inválido. Válidos: {valid_types}")
+    old_type = chunk.asset_type
     chunk.asset_type = payload.asset_type
     if payload.search_keywords:
         chunk.search_keywords = payload.search_keywords
+
+    # If asset type changed, reset status and clear old assets so pipeline re-searches
+    if old_type != payload.asset_type:
+        chunk.status = "pending"
+        chunk.error_message = None
+        # Delete old asset files
+        for old_path_attr in ("image_path", "video_path"):
+            old_path = getattr(chunk, old_path_attr)
+            if old_path:
+                try:
+                    Path(old_path).unlink(missing_ok=True)
+                except Exception:
+                    pass
+        chunk.image_path = None
+        chunk.video_path = None
+        chunk.asset_source = None
+
     db.commit()
-    return {"ok": True, "chunk_number": chunk_number, "asset_type": chunk.asset_type}
+    return {"ok": True, "chunk_number": chunk_number, "asset_type": chunk.asset_type,
+            "status": chunk.status}
 
 
 @router.get("/{project_id}/chunk/{chunk_number}/image")

@@ -1,16 +1,14 @@
-"""Visual Analyzer — uses Claude Haiku to decide what type of visual each scene needs.
+"""Visual Analyzer — uses local Claude Code CLI to decide what type of visual each scene needs.
 
 Also provides image validation: checks if a downloaded image actually matches the scene.
 """
 
-import base64
 import json
 import re
+import subprocess
 import sys
 from pathlib import Path
 from typing import List, Dict
-from openai import OpenAI
-from ..config import settings
 
 
 def _safe_print(msg: str) -> None:
@@ -21,13 +19,60 @@ def _safe_print(msg: str) -> None:
         pass
 
 
-_client = OpenAI(api_key=settings.openrouter_api_key, base_url="https://openrouter.ai/api/v1")
-_MODEL = "anthropic/claude-haiku-4.5"
+def _call_claude_local(prompt: str, system: str = "") -> str:
+    """Call Claude Code CLI locally (uses your active subscription, no API key needed)."""
+    full_prompt = f"{system}\n\n{prompt}" if system else prompt
+    result = subprocess.run(
+        ["claude", "-p", full_prompt],
+        capture_output=True, text=True, timeout=300,
+        encoding="utf-8", errors="replace",
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Claude CLI error: {result.stderr.strip()}")
+    return result.stdout.strip()
+
+
+# ── Vision via Claude Code CLI (uses your subscription — no API key needed) ──
+
+def _call_claude_vision(image_path: str | Path, prompt: str, max_turns: int = 3) -> str:
+    """Call Claude Code CLI with an image file for vision analysis.
+
+    Uses the Read tool so Claude can see the image. This leverages your
+    Claude Code subscription (Sonnet 4) — much better vision than Gemini Flash.
+    Retries up to 2 times on timeout or error.
+    """
+    abs_path = str(Path(image_path).resolve())
+    full_prompt = f'Read the image at {abs_path} and then answer this:\n\n{prompt}'
+
+    last_error = None
+    for attempt in range(1, 3):
+        try:
+            _safe_print(f"[Vision] Claude vision call attempt {attempt}/2...")
+            result = subprocess.run(
+                ["claude", "-p", full_prompt,
+                 "--allowedTools", "Read",
+                 "--max-turns", str(max_turns)],
+                capture_output=True, text=True, timeout=90,
+                encoding="utf-8", errors="replace",
+            )
+            if result.returncode != 0:
+                last_error = f"Claude vision error: {result.stderr.strip()[:200]}"
+                _safe_print(f"[Vision] Attempt {attempt}/2 failed: {last_error}")
+                continue
+            return result.stdout.strip()
+        except subprocess.TimeoutExpired:
+            last_error = "Claude vision TIMEOUT (90s)"
+            _safe_print(f"[Vision] Attempt {attempt}/2: {last_error}")
+            continue
+        except Exception as exc:
+            last_error = str(exc)
+            _safe_print(f"[Vision] Attempt {attempt}/2 error: {last_error}")
+            continue
+
+    raise RuntimeError(f"Claude vision failed after 2 attempts: {last_error}")
 
 
 # ── Image validation with Vision ────────────────────────────────────────────
-
-_VISION_MODEL = "google/gemini-2.0-flash-001"  # Cheap & fast for image validation
 
 
 def validate_image(
@@ -35,8 +80,13 @@ def validate_image(
     scene_text: str,
     search_query: str,
     project_title: str = "",
+    flexible: bool = False,
 ) -> bool:
-    """Check if a downloaded image is relevant to the scene using Gemini Flash Vision.
+    """Check if a downloaded image is relevant to the scene using Claude Sonnet Vision.
+
+    Args:
+        flexible: If True, use a more permissive validation that accepts images
+                  that are broadly related to the topic (not just exact matches).
 
     Returns True if the image is relevant, False if not.
     Fails open (returns True) on any error to avoid blocking the pipeline.
@@ -46,51 +96,205 @@ def validate_image(
         if not image_path.exists() or image_path.stat().st_size < 1000:
             return True  # Can't validate, accept it
 
-        # Read and base64 encode the image
-        img_bytes = image_path.read_bytes()
-        # Limit to ~500KB to keep token costs low
-        if len(img_bytes) > 500_000:
-            _safe_print(f"[Validate] Image too large ({len(img_bytes)}B), skipping validation")
-            return True
-
-        img_b64 = base64.b64encode(img_bytes).decode("utf-8")
-
-        # Detect mime type from extension
-        ext = image_path.suffix.lower()
-        mime_map = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp"}
-        mime_type = mime_map.get(ext, "image/jpeg")
-
         context = f'This is for a video titled: "{project_title}". ' if project_title else ""
-        prompt = (
-            f'{context}\n'
-            f'The scene narration says: "{scene_text[:300]}"\n'
-            f'We searched for: "{search_query}"\n\n'
-            f'Look at this image carefully. Does it SPECIFICALLY match what the scene is talking about?\n'
-            f'- If the video is about a specific movie/person/event, the image MUST show something from that movie/person/event.\n'
-            f'- Generic images, illustrations, cartoons, or unrelated content = NO.\n'
-            f'- Real photos/screenshots that match the specific topic = YES.\n\n'
-            f'Answer ONLY "YES" or "NO".'
-        )
 
-        resp = _client.chat.completions.create(
-            model=_VISION_MODEL,
-            max_tokens=10,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{img_b64}"}},
-                    {"type": "text", "text": prompt},
-                ],
-            }],
-        )
-        answer = resp.choices[0].message.content.strip().upper()
-        is_relevant = "YES" in answer
-        _safe_print(f"[Validate] Image {'APPROVED' if is_relevant else 'REJECTED'} for query='{search_query}' (answer={answer})")
+        if flexible:
+            prompt = (
+                f'{context}\n'
+                f'The scene narration says: "{scene_text[:300]}"\n'
+                f'We searched for: "{search_query}"\n\n'
+                f'You are a PROFESSIONAL VIDEO EDITOR. Would you use this image in this scene?\n'
+                f'Think: "Does this image make sense visually while the narrator says this?"\n\n'
+                f'- YES: any real photo that visually supports what the narrator is talking about\n'
+                f'- YES: behind-the-scenes, cast, awards, events, locations, related imagery\n'
+                f'- YES: photos of the movie/person/event mentioned in the video title\n'
+                f'- NO ONLY if: completely unrelated (e.g., a cat photo for a movie about space)\n\n'
+                f'Be GENEROUS. A pro editor often uses tangentially related imagery.\n'
+                f'Answer ONLY "YES" or "NO".'
+            )
+        else:
+            prompt = (
+                f'{context}\n'
+                f'The scene narration says: "{scene_text[:300]}"\n'
+                f'We searched for: "{search_query}"\n\n'
+                f'Look at this image carefully. Does it SPECIFICALLY match what the scene is talking about?\n'
+                f'- If the video is about a specific movie/person/event, the image MUST show something from that movie/person/event.\n'
+                f'- Generic images, illustrations, cartoons, or unrelated content = NO.\n'
+                f'- Real photos/screenshots that match the specific topic = YES.\n\n'
+                f'Answer ONLY "YES" or "NO".'
+            )
+
+        answer = _call_claude_vision(image_path, prompt)
+        answer_upper = answer.strip().upper()
+        is_relevant = "YES" in answer_upper
+        mode = "flexible" if flexible else "strict"
+        _safe_print(f"[Validate] Image {'APPROVED' if is_relevant else 'REJECTED'} ({mode}) for query='{search_query}' (answer={answer_upper[:20]})")
         return is_relevant
 
     except Exception as exc:
         _safe_print(f"[Validate] Error (accepting image): {exc}")
         return True  # Fail open — don't block pipeline on validation errors
+
+
+def validate_clip_frame(
+    frame_path: str | Path,
+    scene_text: str,
+    search_query: str,
+    project_title: str = "",
+) -> bool:
+    """Validate a video clip frame — stricter than image validation.
+
+    Rejects:
+    - Static posters/movie posters (not real footage)
+    - Text slides (text on dark/plain background — like "On July 4th...")
+    - Title cards, credits, intro/outro slides
+    - Completely unrelated content
+
+    Accepts:
+    - Real video footage (movies, behind-the-scenes, documentaries)
+    - Action scenes, people, locations, events
+    """
+    try:
+        frame_path = Path(frame_path)
+        if not frame_path.exists() or frame_path.stat().st_size < 500:
+            return True
+
+        context = f'Video project: "{project_title}". ' if project_title else ""
+
+        prompt = (
+            f'{context}\n'
+            f'Scene narration: "{scene_text[:300]}"\n'
+            f'Search query: "{search_query}"\n\n'
+            f'This is a frame from a YouTube video clip meant as B-roll footage.\n'
+            f'Is this frame suitable as B-roll for this scene?\n\n'
+            f'REJECT if:\n'
+            f'- It\'s a MOVIE POSTER or promotional image (static, not footage)\n'
+            f'- It\'s a TEXT SLIDE (text on dark/plain background, like trailer text)\n'
+            f'- It\'s a TITLE CARD, credits, or intro/outro screen\n'
+            f'- It\'s a reaction video thumbnail, podcast, or commentary screenshot\n'
+            f'- It\'s completely unrelated to the video topic\n\n'
+            f'ACCEPT if:\n'
+            f'- It shows REAL VIDEO FOOTAGE (movie scenes, behind-the-scenes, documentary)\n'
+            f'- It shows people, locations, action, or events related to the topic\n'
+            f'- It looks like actual filmed content (not a designed graphic)\n\n'
+            f'Answer ONLY "YES" (accept) or "NO" (reject).'
+        )
+
+        answer = _call_claude_vision(frame_path, prompt)
+        answer_upper = answer.strip().upper()
+        is_ok = "YES" in answer_upper
+        _safe_print(f"[ValidateClip] Frame {'APPROVED' if is_ok else 'REJECTED'} for scene (answer={answer_upper[:20]})")
+        return is_ok
+
+    except Exception as exc:
+        _safe_print(f"[ValidateClip] Error (accepting frame): {exc}")
+        return True  # Fail open
+
+
+def analyze_video_cleanliness(
+    frame_path: str | Path,
+    video_width: int = 0,
+    video_height: int = 0,
+) -> dict:
+    """Analyze a video frame for logos, watermarks, text overlays, and black bars.
+
+    Uses Claude Sonnet Vision (local subscription) to detect visual impurities
+    and returns crop/zoom instructions to produce a clean frame.
+
+    Returns dict with:
+        - has_issues: bool — whether any issues were detected
+        - zoom_percent: int — suggested zoom (100 = no zoom, 125 = 25% zoom in)
+        - crop_top_pct: float — % to crop from top (0-20)
+        - crop_bottom_pct: float — % to crop from bottom (0-20)
+        - crop_left_pct: float — % to crop from left (0-15)
+        - crop_right_pct: float — % to crop from right (0-15)
+        - issues: list of strings describing detected issues
+    """
+    try:
+        frame_path = Path(frame_path)
+        if not frame_path.exists() or frame_path.stat().st_size < 1000:
+            return {"has_issues": False, "zoom_percent": 100,
+                    "crop_top_pct": 0, "crop_bottom_pct": 0,
+                    "crop_left_pct": 0, "crop_right_pct": 0, "issues": []}
+
+        size_info = f"Video resolution: {video_width}x{video_height}. " if video_width else ""
+
+        prompt = f"""{size_info}Analyze this video frame for visual impurities to crop out.
+
+Check for:
+1. BLACK BARS: letterbox (top/bottom) or pillarbox (left/right)? Estimate % each bar takes.
+2. LOGOS/WATERMARKS: channel logo or watermark in any corner?
+3. TEXT OVERLAYS: subtitles, "Movie" text, channel name at bottom? Titles at top? Center text?
+4. BORDERS/FRAMES: decorative borders?
+
+Rules for cropping:
+- Bottom text (subtitles, "Movie"): crop bottom 8-15%
+- Corner logo: crop that area 5-12%
+- Black bars: crop them completely
+- Never crop more than 20% from any side
+- If clean, return all zeros
+
+Return ONLY a JSON object (no markdown, no explanation):
+{{
+    "has_issues": true/false,
+    "issues": ["list of issues found"],
+    "crop_top_pct": 0,
+    "crop_bottom_pct": 0,
+    "crop_left_pct": 0,
+    "crop_right_pct": 0,
+    "zoom_percent": 100
+}}"""
+
+        answer = _call_claude_vision(frame_path, prompt)
+        # Clean markdown wrapping
+        answer = re.sub(r"^```(?:json)?\s*", "", answer)
+        answer = re.sub(r"\s*```$", "", answer)
+        result = json.loads(answer)
+
+        # Normalize and validate
+        crop_top = min(20, max(0, float(result.get("crop_top_pct", 0))))
+        crop_bottom = min(20, max(0, float(result.get("crop_bottom_pct", 0))))
+        crop_left = min(15, max(0, float(result.get("crop_left_pct", 0))))
+        crop_right = min(15, max(0, float(result.get("crop_right_pct", 0))))
+        zoom = min(135, max(100, int(result.get("zoom_percent", 100))))
+        has_issues = bool(result.get("has_issues", False))
+        issues = result.get("issues", [])
+
+        # If total crop is too aggressive (>35% total), reduce proportionally
+        total_crop = crop_top + crop_bottom + crop_left + crop_right
+        if total_crop > 35:
+            factor = 35 / total_crop
+            crop_top *= factor
+            crop_bottom *= factor
+            crop_left *= factor
+            crop_right *= factor
+
+        clean_result = {
+            "has_issues": has_issues,
+            "zoom_percent": zoom,
+            "crop_top_pct": round(crop_top, 1),
+            "crop_bottom_pct": round(crop_bottom, 1),
+            "crop_left_pct": round(crop_left, 1),
+            "crop_right_pct": round(crop_right, 1),
+            "issues": issues if isinstance(issues, list) else [],
+        }
+
+        if has_issues:
+            _safe_print(
+                f"[CleanCheck] Issues found: {issues}. "
+                f"Crop: top={crop_top:.1f}% bot={crop_bottom:.1f}% "
+                f"left={crop_left:.1f}% right={crop_right:.1f}% zoom={zoom}%"
+            )
+        else:
+            _safe_print(f"[CleanCheck] Frame is CLEAN — no adjustments needed")
+
+        return clean_result
+
+    except Exception as exc:
+        _safe_print(f"[CleanCheck] Analysis error (skipping cleanup): {exc}")
+        return {"has_issues": False, "zoom_percent": 100,
+                "crop_top_pct": 0, "crop_bottom_pct": 0,
+                "crop_left_pct": 0, "crop_right_pct": 0, "issues": []}
 
 
 def analyze_scenes(
@@ -215,17 +419,9 @@ Devuelve SOLO un JSON array:
   }}
 ]"""
 
-    _safe_print(f"[VisualAnalyzer] Analyzing {len(scenes)} scenes...")
+    _safe_print(f"[VisualAnalyzer] Analyzing {len(scenes)} scenes via local Claude Code...")
 
-    resp = _client.chat.completions.create(
-        model=_MODEL,
-        max_tokens=8000,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-    )
-    raw = resp.choices[0].message.content.strip()
+    raw = _call_claude_local(user_prompt, system=system_prompt)
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
     results = json.loads(raw)

@@ -103,6 +103,7 @@ class Chunk(Base):
     start_ms = Column(Integer, nullable=True)    # scene start in milliseconds
     end_ms = Column(Integer, nullable=True)      # scene end in milliseconds
     error_message = Column(Text, nullable=True)
+    rejected_sources = Column(Text, nullable=True)  # JSON list of rejected youtube_ids/URLs for "Rebuscar"
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

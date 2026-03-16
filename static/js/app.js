@@ -490,8 +490,8 @@ async function refreshDetail(projectId) {
           // Action buttons
           let actions = '';
           if (_isStockMode) {
-            // Stock mode: "Rebuscar" button to re-search the asset
-            if (c.image_path || c.video_path) {
+            // Stock mode: "Rebuscar" button to re-search the asset (also show on error scenes)
+            if (c.image_path || c.video_path || c.status === 'error') {
               actions += `<button class="st-action-btn" title="Rebuscar" onclick="event.stopPropagation(); retryStockSearch(${n})">&#x1F504;</button>`;
             }
           } else {
@@ -2839,9 +2839,65 @@ async function searchStockAssets() {
 
 async function retryStockSearch(chunkNumber) {
   if (!currentProjectId) return;
-  showToast(`🔍 Rebuscando asset para escena ${chunkNumber}…`, 'info');
+  showToast(`🔍 Rebuscando asset para escena ${chunkNumber}… (puede tardar 30-60s)`, 'info');
   try {
+    // Get current state BEFORE retry so we can detect when it changes
+    const beforeResp = await apiFetch(`/api/projects/${currentProjectId}`);
+    const beforeChunk = (beforeResp.chunks || []).find(c => c.chunk_number === chunkNumber);
+    const beforeVideoPath = beforeChunk ? beforeChunk.video_path : null;
+    const beforeImagePath = beforeChunk ? beforeChunk.image_path : null;
+    const beforeUpdated = beforeChunk ? beforeChunk.updated_at : null;
+
+    // Fire the retry (runs in background)
     await apiFetch(`/api/projects/${currentProjectId}/retry-chunk-image/${chunkNumber}`, { method: 'POST' });
+
+    // Poll until the chunk changes (new file or status change)
+    let attempts = 0;
+    const maxAttempts = 40; // 40 × 3s = 120s max wait
+    const pollInterval = 3000;
+
+    const pollForChange = async () => {
+      let sawPending = false;
+      while (attempts < maxAttempts) {
+        attempts++;
+        await new Promise(r => setTimeout(r, pollInterval));
+        try {
+          const resp = await apiFetch(`/api/projects/${currentProjectId}`);
+          const chunk = (resp.chunks || []).find(c => c.chunk_number === chunkNumber);
+          if (!chunk) break;
+
+          // Track if we ever saw a 'pending' state (means backend started processing)
+          if (chunk.status === 'pending' || chunk.status === 'searching') {
+            sawPending = true;
+            continue;
+          }
+
+          // If status is done/error AND we either saw pending or updated_at changed
+          const isFinished = chunk.status === 'done' || chunk.status === 'error';
+          const hasChanged = chunk.updated_at !== beforeUpdated ||
+                             chunk.video_path !== beforeVideoPath ||
+                             chunk.image_path !== beforeImagePath;
+
+          if (isFinished && (sawPending || hasChanged)) {
+            await refreshDetail(currentProjectId);
+            if (chunk.status === 'error') {
+              showToast(`❌ Escena ${chunkNumber}: no se encontró un clip diferente`, 'error');
+            } else {
+              showToast(`✅ Escena ${chunkNumber}: nuevo clip encontrado!`, 'success');
+            }
+            return;
+          }
+        } catch (_) { /* ignore poll errors */ }
+      }
+      // Timeout — refresh anyway
+      await refreshDetail(currentProjectId);
+      showToast(`⏰ Escena ${chunkNumber}: tiempo agotado, revisa el estado`, 'warning');
+    };
+
+    // Start polling (don't await — let it run in background)
+    pollForChange();
+
+    // Immediate refresh to show "pending" status
     await refreshDetail(currentProjectId);
   } catch (e) {
     showToast('Error al rebuscar: ' + e.message, 'error');

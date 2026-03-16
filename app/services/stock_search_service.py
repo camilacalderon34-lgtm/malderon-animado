@@ -15,6 +15,7 @@ from . import pexels_service, pixabay_service
 from . import ddg_image_service  # only for _is_blocked watermark check
 from . import web_image_service
 from . import visual_analyzer_service
+from . import youtube_clip_service
 
 
 def _safe_print(msg: str) -> None:
@@ -336,6 +337,7 @@ def find_asset_for_scene(
     scene_text: str = "",
     project_title: str = "",
     reject_hash: str | None = None,
+    skip_remote_bank: bool = False,
 ) -> Dict:
     """Find and download the best asset for a scene.
 
@@ -379,7 +381,7 @@ def find_asset_for_scene(
     # Only use clip bank for types that need video (clip_bank, stock_video, archive, space)
     # Skip for web_image (needs static images from DDG)
     clip_bank_url = settings.clip_bank_url if hasattr(settings, "clip_bank_url") else ""
-    if clip_bank_url and asset_type not in ("web_image", "title_card"):
+    if clip_bank_url and asset_type not in ("web_image", "title_card") and not skip_remote_bank:
         bank_result = _search_via_clip_bank(
             clip_bank_url, scene_id, query, query_alt, asset_type,
             collection, video_dest, image_dest, used_videos,
@@ -401,8 +403,31 @@ def find_asset_for_scene(
                                    scene_text=scene_text, project_title=project_title,
                                    used_urls=used_videos, reject_hash=reject_hash)
     elif asset_type == "clip_bank":
-        # clip_bank: PC1 didn't find a video — leave empty, don't substitute a random image
-        _safe_print(f"[StockSearch] Scene {scene_id}: clip_bank — no video found, leaving empty")
+        # clip_bank: search YouTube, download and cut a clip using Claude + yt-dlp
+        _safe_print(f"[StockSearch] Scene {scene_id}: clip_bank — searching YouTube via Claude...")
+        # Extract hash-based reject set from used_videos
+        _reject_hashes = set()
+        if used_videos:
+            _reject_hashes = {h.split(":", 1)[1] for h in used_videos if h.startswith("hash:")}
+        yt_result = youtube_clip_service.find_youtube_clip(
+            scene_text=scene_text,
+            search_query=query,
+            search_query_alt=query_alt,
+            project_title=project_title,
+            min_duration=min_duration if min_duration else 5.0,
+            dest_path=video_dest,
+            collection=collection,
+            used_urls=used_videos,
+            reject_hashes=_reject_hashes if _reject_hashes else None,
+        )
+        if yt_result:
+            result.update(
+                asset_type_found=yt_result["asset_type_found"],
+                asset_source=yt_result["asset_source"],
+                local_path=yt_result["local_path"],
+                youtube_id=yt_result.get("youtube_id", ""),
+                youtube_title=yt_result.get("youtube_title", ""),
+            )
     elif asset_type == "title_card":
         # title_card: will be generated with Remotion later — leave empty
         _safe_print(f"[StockSearch] Scene {scene_id}: title_card — pending Remotion, leaving empty")
@@ -639,18 +664,94 @@ def _file_hash(path: Path) -> str | None:
     return None
 
 
+def _generate_image_queries_with_claude(scene_text: str, project_title: str,
+                                         original_query: str, original_query_alt: str) -> list[str]:
+    """Use Claude (local subscription) to generate highly specific image search queries.
+
+    Returns a list of 3-4 search queries optimized for finding the EXACT image
+    that matches what the scene is talking about.
+    """
+    import subprocess as _sp
+    import json as _json
+    import re as _re
+
+    fallback = [original_query, original_query_alt] if original_query_alt else [original_query]
+
+    prompt = (
+        f'You are a PROFESSIONAL VIDEO EDITOR choosing the perfect image for each scene.\n\n'
+        f'Video title: "{project_title}"\n'
+        f'Scene narration: "{scene_text[:400]}"\n'
+        f'Original search queries: "{original_query}" / "{original_query_alt}"\n\n'
+        f'Think like a PRO editor: what image would you PUT in this scene to visually support '
+        f'what the narrator is saying? Consider the video\'s subject and what would look great.\n\n'
+        f'Generate 5 Google Image search queries to find REAL PHOTOS for this scene.\n\n'
+        f'CRITICAL RULES:\n'
+        f'- ALWAYS include the specific subject from the video title in your queries.\n'
+        f'- The scene may use generic words but it\'s ALWAYS about the video title topic.\n'
+        f'- Think: "If I were editing this video and the narrator says THIS, what image do I need?"\n'
+        f'- Example: video="Independence Day 1996" scene="won an Oscar for best visual effects"\n'
+        f'  → search "Independence Day 1996 Academy Award ceremony", "Independence Day Oscar visual effects 1997", '
+        f'"69th Academy Awards Independence Day", "Independence Day movie VFX Oscar statue"\n'
+        f'- Another example: video="Titanic 1997" scene="the ship was built at full scale"\n'
+        f'  → "Titanic 1997 full scale ship set construction", "Titanic movie set Baja Studios", '
+        f'"James Cameron Titanic ship built"\n'
+        f'- Each query must be in ENGLISH, 3-8 words\n'
+        f'- Include SPECIFIC names of movies, people, places, years\n'
+        f'- Query 1-2: very specific (exactly what the scene describes, with video subject)\n'
+        f'- Query 3: behind-the-scenes or production angle\n'
+        f'- Query 4: related but different visual angle\n'
+        f'- Query 5: broader/simpler version that will definitely find results\n\n'
+        f'Return ONLY a JSON array of 5 strings, nothing else.\n'
+        f'Example: ["Independence Day 1996 Oscar visual effects award", "69th Academy Awards best visual effects winner", '
+        f'"Independence Day 1996 special effects making of", "Independence Day movie VFX team", '
+        f'"Independence Day 1996 film photo"]'
+    )
+
+    # Retry up to 3 times on timeout/error
+    for attempt in range(1, 4):
+        try:
+            _safe_print(f"[WebImg] Claude query gen attempt {attempt}/3...")
+            result = _sp.run(
+                ["claude", "-p", prompt],
+                capture_output=True, text=True, timeout=90,
+                encoding="utf-8", errors="replace",
+            )
+            if result.returncode != 0:
+                _safe_print(f"[WebImg] Claude query gen error (attempt {attempt}/3): {result.stderr[:200]}")
+                continue  # retry
+
+            text = result.stdout.strip()
+            match = _re.search(r'\[.*\]', text, _re.DOTALL)
+            if match:
+                queries = _json.loads(match.group())
+                if isinstance(queries, list) and len(queries) >= 1:
+                    _safe_print(f"[WebImg] Claude generated {len(queries)} queries: {queries}")
+                    return [str(q) for q in queries[:5]]
+
+            _safe_print(f"[WebImg] Claude returned non-JSON (attempt {attempt}/3), retrying...")
+            continue
+
+        except _sp.TimeoutExpired:
+            _safe_print(f"[WebImg] Claude query gen TIMEOUT (attempt {attempt}/3, 90s)")
+            continue
+        except Exception as exc:
+            _safe_print(f"[WebImg] Claude query gen failed (attempt {attempt}/3): {exc}")
+            continue
+
+    _safe_print(f"[WebImg] Claude query gen FAILED after 3 attempts, using original queries")
+    return fallback
+
+
 def _search_web_image(scene_id, query, query_alt, image_dest, result,
                       scene_text="", project_title="", used_urls: set | None = None,
                       reject_hash: str | None = None):
     """Search web for IMAGES only (no video).
 
-    Gets multiple candidates from Bing/Brave/Wikimedia and tries
-    downloading each. After download, validates with Gemini Flash Vision
-    to ensure the image matches the scene (max 5 validations per scene).
-    Skips URLs already in used_urls to prevent duplicates across scenes.
-    If reject_hash is set, rejects any image with matching MD5 (for retry).
+    Uses Claude to generate optimized search queries, then searches
+    Bing/Brave/Wikimedia for candidates. Validates each download with
+    Claude Vision to ensure the image matches the scene content.
     """
-    max_validations = 5  # Limit AI validation calls per scene
+    max_validations = 10  # Limit AI validation calls per search round
     validations_done = 0
 
     def _is_used(url):
@@ -675,42 +776,203 @@ def _search_web_image(scene_id, query, query_alt, image_dest, result,
             _safe_print(f"[WebImg] Scene {scene_id}: SKIP same image as before (hash match)")
             image_dest.unlink(missing_ok=True)
             return False
-        # Validate with AI vision if we haven't exhausted validation budget
+        # Validate with Claude Vision if we haven't exhausted validation budget
         if validations_done < max_validations and scene_text:
             validations_done += 1
             if not visual_analyzer_service.validate_image(
                 image_dest, scene_text, q, project_title
             ):
                 # Image rejected — delete and try next
+                _safe_print(f"[WebImg] Scene {scene_id}: REJECTED by Claude Vision (validation {validations_done}/{max_validations})")
                 image_dest.unlink(missing_ok=True)
                 return False
+            _safe_print(f"[WebImg] Scene {scene_id}: APPROVED by Claude Vision")
         _mark_used(url)
         result.update(asset_type_found="image", asset_source="web_search", local_path=str(image_dest))
         return True
 
-    # 1. Get all candidates for primary query
-    try:
-        candidates = web_image_service.search_image_candidates(query, max_per_source=6)
-        _safe_print(f"[WebImg] Scene {scene_id}: {len(candidates)} candidates for '{query}'")
-        for i, url in enumerate(candidates):
-            _safe_print(f"[WebImg] Scene {scene_id}: trying candidate {i+1}/{len(candidates)}: {url[:80]}")
-            if _try_candidate(url, query):
-                return result
-    except Exception as exc:
-        _safe_print(f"[WebImg] Scene {scene_id}: primary search error: {exc}")
+    # ── Step 1: Use Claude to generate optimized search queries ──
+    _safe_print(f"[WebImg] Scene {scene_id}: asking Claude for better search queries...")
+    smart_queries = _generate_image_queries_with_claude(
+        scene_text, project_title, query, query_alt
+    )
 
-    # 2. Try alt query candidates
-    if query_alt:
+    # ── Step 2: Search with each query until we find a valid image ──
+    for qi, q in enumerate(smart_queries):
         try:
-            candidates = web_image_service.search_image_candidates(query_alt, max_per_source=4)
-            _safe_print(f"[WebImg] Scene {scene_id}: {len(candidates)} candidates for alt '{query_alt}'")
+            candidates = web_image_service.search_image_candidates(q, max_per_source=5)
+            _safe_print(f"[WebImg] Scene {scene_id}: query {qi+1}/{len(smart_queries)} '{q}' -> {len(candidates)} candidates")
             for i, url in enumerate(candidates):
-                _safe_print(f"[WebImg] Scene {scene_id}: trying alt candidate {i+1}/{len(candidates)}: {url[:80]}")
-                if _try_candidate(url, query_alt):
+                if validations_done >= max_validations:
+                    _safe_print(f"[WebImg] Scene {scene_id}: validation budget exhausted ({max_validations})")
+                    break
+                _safe_print(f"[WebImg] Scene {scene_id}: trying [{qi+1}:{i+1}] {url[:80]}")
+                if _try_candidate(url, q):
                     return result
         except Exception as exc:
-            _safe_print(f"[WebImg] Scene {scene_id}: alt search error: {exc}")
+            _safe_print(f"[WebImg] Scene {scene_id}: search error for '{q}': {exc}")
 
+    # ── Step 3: Fallback — try original queries if Claude's didn't work ──
+    fallback_queries = [query]
+    if query_alt:
+        fallback_queries.append(query_alt)
+    # Only try originals if they weren't already in smart_queries
+    for q in fallback_queries:
+        if q in smart_queries:
+            continue
+        try:
+            candidates = web_image_service.search_image_candidates(q, max_per_source=4)
+            _safe_print(f"[WebImg] Scene {scene_id}: fallback '{q}' -> {len(candidates)} candidates")
+            for url in candidates:
+                if validations_done >= max_validations:
+                    break
+                if _try_candidate(url, q):
+                    return result
+        except Exception:
+            pass
+
+    # ── Step 4: EXTENDED SEARCH — flexible validation, more sources ──
+    # Strict validation rejected everything. Now use FLEXIBLE validation (accepts broadly related images).
+    _safe_print(f"[WebImg] Scene {scene_id}: strict search exhausted. Extended search with FLEXIBLE validation...")
+    validations_done = 0  # Reset budget
+    max_validations = 10  # Fresh budget for flexible mode
+
+    def _try_flexible(url, q, source_name):
+        nonlocal validations_done
+        if _is_used(url):
+            return False
+        if not download_asset(url, image_dest, require_landscape=False):
+            return False
+        if reject_hash and _file_hash(image_dest) == reject_hash:
+            image_dest.unlink(missing_ok=True)
+            return False
+        if validations_done < max_validations and scene_text:
+            validations_done += 1
+            if not visual_analyzer_service.validate_image(
+                image_dest, scene_text, q, project_title, flexible=True
+            ):
+                _safe_print(f"[WebImg] Scene {scene_id}: {source_name} REJECTED even in flexible mode ({validations_done}/{max_validations})")
+                image_dest.unlink(missing_ok=True)
+                return False
+            _safe_print(f"[WebImg] Scene {scene_id}: {source_name} APPROVED (flexible)")
+        _mark_used(url)
+        result.update(asset_type_found="image", asset_source=source_name, local_path=str(image_dest))
+        return True
+
+    # 4a. Re-search web with project title prepended to every query
+    title_prefix = (project_title or "").split(":")[0].strip()[:40]
+    title_queries = []
+    if title_prefix:
+        title_queries = [
+            f"{title_prefix} behind the scenes",
+            f"{title_prefix} movie photo",
+            f"{title_prefix} film production",
+            f"{title_prefix} real photo",
+        ]
+    for tq in title_queries:
+        try:
+            candidates = web_image_service.search_image_candidates(tq, max_per_source=5)
+            _safe_print(f"[WebImg] Scene {scene_id}: title-query '{tq}' -> {len(candidates)} candidates")
+            for url in candidates:
+                if validations_done >= max_validations:
+                    break
+                if _try_flexible(url, tq, "web_search"):
+                    return result
+        except Exception:
+            pass
+
+    # 4b. Try Pexels/Pixabay
+    for q in [query, query_alt]:
+        if not q:
+            continue
+        for src_name, fn in [("pexels", _try_pexels_image), ("pixabay", _try_pixabay_image)]:
+            url = fn(q)
+            if url and _try_flexible(url, q, src_name):
+                return result
+
+    # 4c. Try simplified scene text queries
+    simple_words = " ".join((scene_text or query)[:60].split()[:5])
+    for sq in [simple_words, f"{title_prefix} {simple_words}"]:
+        try:
+            candidates = web_image_service.search_image_candidates(sq, max_per_source=5)
+            _safe_print(f"[WebImg] Scene {scene_id}: simple '{sq}' -> {len(candidates)} candidates")
+            for url in candidates:
+                if validations_done >= max_validations:
+                    break
+                if _try_flexible(url, sq, "web_search"):
+                    return result
+        except Exception:
+            pass
+
+    # 4d. Try Pexels/Pixabay with title-based queries (broader)
+    stock_queries = [title_prefix, f"{title_prefix} movie", f"{title_prefix} film"]
+    if title_prefix:
+        for sq in stock_queries:
+            for src_name, fn in [("pexels", _try_pexels_image), ("pixabay", _try_pixabay_image)]:
+                url = fn(sq)
+                if url and _try_flexible(url, sq, src_name):
+                    return result
+
+    # ── Step 5: ÚLTIMO RECURSO — accept ANY image without AI validation ──
+    # Better to have a related image than no image at all.
+    _safe_print(f"[WebImg] Scene {scene_id}: ALL validated searches exhausted. LAST RESORT: accepting first downloadable image...")
+
+    last_resort_queries = []
+    if title_prefix:
+        last_resort_queries.extend([
+            f"{title_prefix}",
+            f"{title_prefix} movie scene",
+            f"{title_prefix} film",
+        ])
+    # Add scene-specific keywords
+    scene_keywords = " ".join((scene_text or "")[:80].split()[:6])
+    if scene_keywords:
+        last_resort_queries.append(scene_keywords)
+    last_resort_queries.append(query)
+    if query_alt:
+        last_resort_queries.append(query_alt)
+
+    def _try_no_validation(url, source_tag):
+        """Download and accept without AI validation — last resort."""
+        if _is_used(url):
+            return False
+        if not download_asset(url, image_dest, require_landscape=False):
+            return False
+        if reject_hash and _file_hash(image_dest) == reject_hash:
+            image_dest.unlink(missing_ok=True)
+            return False
+        # Basic sanity: file must be > 5KB (not a placeholder/icon)
+        if image_dest.exists() and image_dest.stat().st_size < 5000:
+            _safe_print(f"[WebImg] Scene {scene_id}: last resort too small ({image_dest.stat().st_size}B), skip")
+            image_dest.unlink(missing_ok=True)
+            return False
+        _mark_used(url)
+        _safe_print(f"[WebImg] Scene {scene_id}: LAST RESORT accepted from {source_tag}")
+        result.update(asset_type_found="image", asset_source=source_tag, local_path=str(image_dest))
+        return True
+
+    for lrq in last_resort_queries:
+        if not lrq or not lrq.strip():
+            continue
+        # Try web search
+        try:
+            candidates = web_image_service.search_image_candidates(lrq, max_per_source=5)
+            _safe_print(f"[WebImg] Scene {scene_id}: LAST RESORT web '{lrq}' -> {len(candidates)} candidates")
+            for url in candidates:
+                if _try_no_validation(url, "web_search_lastresort"):
+                    return result
+        except Exception:
+            pass
+        # Try Pexels
+        url = _try_pexels_image(lrq)
+        if url and _try_no_validation(url, "pexels_lastresort"):
+            return result
+        # Try Pixabay
+        url = _try_pixabay_image(lrq)
+        if url and _try_no_validation(url, "pixabay_lastresort"):
+            return result
+
+    _safe_print(f"[WebImg] Scene {scene_id}: ABSOLUTELY NOTHING found after all 5 steps")
     return result
 
 
