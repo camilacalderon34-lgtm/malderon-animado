@@ -68,6 +68,8 @@ class ProjectOut(BaseModel):
     voiceover_path: Optional[str] = None
     error_message: Optional[str]
     final_video_path: Optional[str]
+    preview_path: Optional[str] = None
+    preview_progress: int = 0
     render_progress: int = 0
     collection: Optional[str] = "general"
     created_at: datetime

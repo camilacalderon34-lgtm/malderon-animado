@@ -295,7 +295,7 @@ class GenAIProTTS(TTSProvider):
             raise RuntimeError(f"No task_id en la respuesta: {data}")
         return str(task_id)
 
-    def _poll_task(self, task_id: str, max_wait: int = 600) -> tuple:
+    def _poll_task(self, task_id: str, max_wait: int = 1200) -> tuple:
         """Poll GET /labs/task/{task_id} every 5 s until status == 'completed'.
 
         Returns (result_url, subtitle_url_or_None, full_response_dict).
@@ -304,12 +304,16 @@ class GenAIProTTS(TTSProvider):
         headers  = {"Authorization": f"Bearer {self.api_key}"}
         deadline = time.time() + max_wait
 
+        poll_count = 0
         while time.time() < deadline:
+            poll_count += 1
+            elapsed = int(time.time() - (deadline - max_wait))
             r = requests.get(poll_url, headers=headers, timeout=30)
             r.raise_for_status()
             data   = r.json()
             status = data.get("status", "").lower()
-            _safe_print(f"[GenAIPro] poll status={status!r} keys={list(data.keys())}")
+            progress = data.get("progress", "")
+            _safe_print(f"[GenAIPro] poll #{poll_count} ({elapsed}s) status={status!r} progress={progress} keys={list(data.keys())}")
 
             if status == "completed":
                 result_url   = data.get("result", "")

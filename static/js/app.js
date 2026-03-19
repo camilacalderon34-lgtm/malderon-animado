@@ -20,14 +20,39 @@ let _settings = {};
 
 // Asset type filter — which types the planner can assign
 const ALL_ASSET_TYPES = [
-  { key: 'clip_bank',    icon: '🎬', label: 'Clip Bank' },
   { key: 'title_card',   icon: '📝', label: 'Titulo' },
-  { key: 'web_image',    icon: '🌐', label: 'Img Web' },
+  { key: 'web_image',    icon: '🌐', label: 'Imagen Animada' },
+  { key: 'web_image_full', icon: '🖼️', label: 'Imagen Completa' },
   { key: 'ai_image',     icon: '🤖', label: 'AI Image' },
   { key: 'stock_video',  icon: '📹', label: 'Stock Vid' },
   { key: 'archive_footage', icon: '🏛️', label: 'Archivo' },
 ];
-let _activeAssetTypes = new Set(['clip_bank', 'title_card', 'web_image', 'ai_image']);
+let _activeAssetTypes = new Set(['title_card', 'web_image', 'ai_image']);
+
+/* ── Dynamic pills from chain config ──────────────────────────────────── */
+const TITLE_PILL = { key: 'title_card', icon: '📝', label: 'Titulo' };
+const CAT_PILL_ICONS = { film: '📹', youtube: '▶️', globe: '🌐', robot: '🤖', archive: '🏛️' };
+let _visiblePills = [TITLE_PILL, ...ALL_ASSET_TYPES.slice(1)]; // default: all
+
+async function loadChainPills(colName) {
+  try {
+    const data = await apiFetch(`/api/projects/collections/${encodeURIComponent(colName)}/chain`);
+    const cats = (data.categories || []).filter(c => c.enabled && c.pct > 0);
+    _visiblePills = [TITLE_PILL];
+    for (const cat of cats) {
+      _visiblePills.push({
+        key: cat.asset_type,
+        catId: cat.id,
+        icon: CAT_PILL_ICONS[cat.icon] || '📦',
+        label: cat.label,
+      });
+    }
+  } catch (_) {
+    _visiblePills = [TITLE_PILL, ...ALL_ASSET_TYPES.slice(1)];
+  }
+  _activeAssetTypes = new Set(_visiblePills.map(p => p.key));
+  renderAssetTypeFilters();
+}
 
 /** Return capitalised image provider name from settings. */
 function _imgProviderName() {
@@ -172,7 +197,9 @@ async function openDetail(projectId) {
   if (p && activeStates.includes(p.status)) {
     startLogStream(projectId);
   }
-  pollInterval = setInterval(() => refreshDetail(projectId), 4000);
+  // Slower polling for large projects to reduce UI lag
+  const pollMs = (p && p.chunk_count > 200) ? 8000 : 4000;
+  pollInterval = setInterval(() => refreshDetail(projectId), pollMs);
 }
 
 async function refreshDetail(projectId) {
@@ -402,20 +429,28 @@ async function refreshDetail(projectId) {
         return `${m}:${String(s).padStart(2, '0')}`;
       };
 
-      // Build a fingerprint per chunk to detect changes
-      const newFingerprint = chunks.map(c =>
-        `${c.chunk_number}:${c.status}:${c.image_path||''}:${c.video_path||''}:${c.image_prompt||''}:${c.motion_prompt||''}:${c.asset_type||''}:${c.updated_at||''}`
-      ).join('|');
+      // Build per-chunk fingerprints to detect individual row changes
+      if (!window._chunkFingerprints) window._chunkFingerprints = {};
+      const needsFullBuild = list.children.length === 0 || list.children.length !== chunks.length;
+      const changedChunks = new Set();
+      chunks.forEach(c => {
+        const fp = `${c.chunk_number}:${c.status}:${c.image_path||''}:${c.video_path||''}:${c.image_prompt||''}:${c.motion_prompt||''}:${c.asset_type||''}:${c.updated_at||''}`;
+        if (window._chunkFingerprints[c.chunk_number] !== fp) {
+          changedChunks.add(c.chunk_number);
+          window._chunkFingerprints[c.chunk_number] = fp;
+        }
+      });
 
-      // Only rebuild if data actually changed
-      if (list.dataset.fingerprint === newFingerprint && list.children.length > 0) {
-        // No changes — skip rebuild to avoid image flicker
+      // Skip if nothing changed
+      if (changedChunks.size === 0 && !needsFullBuild) {
+        // No changes — skip rebuild to avoid flicker
       } else {
-        list.dataset.fingerprint = newFingerprint;
-        list.innerHTML = '';
+        if (needsFullBuild) list.innerHTML = '';
 
-        chunks.forEach(c => {
+        chunks.forEach((c, idx) => {
           const n = c.chunk_number;
+          // Skip unchanged rows (only when doing partial update)
+          if (!needsFullBuild && !changedChunks.has(n)) return;
           const text = c.scene_text || '';
           const cacheBust = c.updated_at ? `?t=${new Date(c.updated_at).getTime()}` : `?t=${Date.now()}`;
           const imgUrl = c.image_path ? `/api/projects/${p.id}/chunk/${n}/image${cacheBust}` : '';
@@ -446,8 +481,8 @@ async function refreshDetail(projectId) {
           }
 
           // Asset type badge (stock mode)
-          const _assetLabels = {clip_bank:'Clip Bank',stock_video:'Stock Vid',title_card:'Titulo',web_image:'Img Web',ai_image:'AI Image',archive_footage:'Archivo',space_media:'Espacio',video:'Video',image:'Imagen'};
-          const _assetIcons = {clip_bank:'🎬',stock_video:'📹',title_card:'📝',web_image:'🌐',ai_image:'🤖',archive_footage:'🏛️',space_media:'🚀',video:'🎬',image:'🖼️'};
+          const _assetLabels = {stock_video:'Stock Vid',title_card:'Titulo',web_image:'Imagen Animada',web_image_full:'Imagen Completa',ai_image:'AI Image',archive_footage:'Archivo',space_media:'Espacio',video:'Video',image:'Imagen'};
+          const _assetIcons = {stock_video:'📹',title_card:'📝',web_image:'🌐',web_image_full:'🖼️',ai_image:'🤖',archive_footage:'🏛️',space_media:'🚀',video:'🎬',image:'🖼️'};
           let assetBadge = '';
           if (c.asset_type) {
             const aLabel = _assetLabels[c.asset_type] || c.asset_type;
@@ -490,10 +525,8 @@ async function refreshDetail(projectId) {
           // Action buttons
           let actions = '';
           if (_isStockMode) {
-            // Stock mode: "Rebuscar" button to re-search the asset (also show on error scenes)
-            if (c.image_path || c.video_path || c.status === 'error') {
-              actions += `<button class="st-action-btn" title="Rebuscar" onclick="event.stopPropagation(); retryStockSearch(${n})">&#x1F504;</button>`;
-            }
+            // Stock mode: always show "Rebuscar" button so user can retry any scene individually
+            actions += `<button class="st-action-btn" title="Rebuscar" onclick="event.stopPropagation(); retryStockSearch(${n})">&#x1F504;</button>`;
           } else {
             // Animated mode: original buttons
             if (c.image_prompt) {
@@ -517,6 +550,7 @@ async function refreshDetail(projectId) {
 
           const row = document.createElement('div');
           row.className = 'scene-row' + (_isStockMode ? ' stock-mode' : '');
+          row.setAttribute('data-chunk', n);
 
           if (_isStockMode) {
             // Stock: # | Guion (badge + text) | Salida | Tiempo | Estado | Actions
@@ -547,7 +581,13 @@ async function refreshDetail(projectId) {
               <div class="st-col st-actions">${actions}</div>
             `;
           }
-          list.appendChild(row);
+          if (needsFullBuild) {
+            list.appendChild(row);
+          } else {
+            // Replace only the changed row
+            const existing = list.querySelector(`[data-chunk="${n}"]`);
+            if (existing) existing.replaceWith(row);
+          }
         });
       }
     } else {
@@ -569,7 +609,10 @@ async function refreshDetail(projectId) {
       const stockBtns = document.getElementById('stockActionButtons');
       if (stockBtns) {
         stockBtns.style.display = (isStock && showImagePanel) ? 'flex' : 'none';
-        if (isStock && showImagePanel) renderAssetTypeFilters();
+        if (isStock && showImagePanel) {
+          const col = p.collection || 'general';
+          loadChainPills(col);  // loads chain config → renders only enabled pills
+        }
       }
 
       // Character reference UI
@@ -1017,141 +1060,169 @@ let _selectedCollection = 'general';
 let _allCollections = []; // [{name, icon, display_name}]
 let _clipBankAvailable = false;
 
-const cbIcon = (n) => {
-  const col = _allCollections.find(c => c.name === n);
-  return col ? col.icon : '📁';
+/* ── SVG icon system for collections ── */
+const COL_ICONS = {
+  general:  '<svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>',
+  film:     '<svg viewBox="0 0 24 24"><rect x="2" y="4" width="20" height="16" rx="2"/><line x1="2" y1="8" x2="22" y2="8"/><line x1="6" y1="4" x2="6" y2="8"/><line x1="10" y1="4" x2="10" y2="8"/><line x1="14" y1="4" x2="14" y2="8"/><line x1="18" y1="4" x2="18" y2="8"/></svg>',
+  travel:   '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><ellipse cx="12" cy="12" rx="4" ry="9"/><line x1="3" y1="12" x2="21" y2="12"/></svg>',
+  nature:   '<svg viewBox="0 0 24 24"><path d="M12 3C7 8 4 12 4 15a8 8 0 0016 0c0-3-3-7-8-12z"/></svg>',
+  tech:     '<svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="12" rx="2"/><line x1="8" y1="20" x2="16" y2="20"/><line x1="12" y1="16" x2="12" y2="20"/></svg>',
+  food:     '<svg viewBox="0 0 24 24"><path d="M3 12a9 9 0 0118 0H3z"/><line x1="3" y1="15" x2="21" y2="15"/><path d="M5 15v2a7 7 0 0014 0v-2"/></svg>',
+  music:    '<svg viewBox="0 0 24 24"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>',
+  history:  '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 15"/></svg>',
+  sports:   '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 3c-2 3-3 6-3 9s1 6 3 9"/><path d="M12 3c2 3 3 6 3 9s-1 6-3 9"/></svg>',
+  default:  '<svg viewBox="0 0 24 24"><path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/></svg>',
 };
+
+function colIconSvg(name) {
+  const n = (name || '').toLowerCase();
+  if (n === 'general') return COL_ICONS.general;
+  if (/film|cine|movie|pelicula/.test(n)) return COL_ICONS.film;
+  if (/viaj|travel|turism/.test(n)) return COL_ICONS.travel;
+  if (/natur|animal|wild/.test(n)) return COL_ICONS.nature;
+  if (/tech|comput|robot|ia|ai|prog/.test(n)) return COL_ICONS.tech;
+  if (/food|cocina|comida|recet/.test(n)) return COL_ICONS.food;
+  if (/music|musica|song/.test(n)) return COL_ICONS.music;
+  if (/histor|antiguo|medieval/.test(n)) return COL_ICONS.history;
+  if (/sport|deport|futbol|soccer/.test(n)) return COL_ICONS.sports;
+  return COL_ICONS.default;
+}
 
 async function loadCollections() {
   try {
     const data = await apiFetch('/api/projects/collections/list');
     _clipBankAvailable = data.source === 'clip_bank';
     const cols = data.collections || [];
-    // Normalize: ensure objects with {name, icon, display_name}
     _allCollections = cols.map(c =>
-      typeof c === 'string'
-        ? { name: c, icon: c === 'general' ? '📦' : '📁', display_name: c }
-        : c
+      typeof c === 'string' ? { name: c, display_name: c } : c
     );
-    // Ensure general is first
     const gi = _allCollections.findIndex(c => c.name === 'general');
     if (gi > 0) { const g = _allCollections.splice(gi, 1)[0]; _allCollections.unshift(g); }
-    else if (gi < 0) { _allCollections.unshift({ name: 'general', icon: '📦', display_name: 'general' }); }
+    else if (gi < 0) { _allCollections.unshift({ name: 'general', display_name: 'general' }); }
   } catch (_) {
-    _allCollections = [{ name: 'general', icon: '📦', display_name: 'general' }];
+    _allCollections = [{ name: 'general', display_name: 'general' }];
   }
-  renderComboList();
+  renderCollectionPills();
 }
 
-function renderComboList(filterText = '') {
-  const ul = document.getElementById('cbList');
-  if (!ul) return;
-  const q = filterText.toLowerCase();
-  const filtered = q ? _allCollections.filter(c => c.name.includes(q) || c.display_name.toLowerCase().includes(q)) : _allCollections;
-  ul.innerHTML = filtered.map(c => `
-    <li class="${c.name === _selectedCollection ? 'selected' : ''}" onclick="cbSelect('${c.name}')">
-      <span>${c.icon}</span><span>${c.display_name || c.name}</span>
-      <span class="cb-chain-btn" onclick="event.stopPropagation(); openChainConfig('${c.name}')" title="Configurar cadena de búsqueda">⚙️</span>
-    </li>
-  `).join('');
-  const trimmed = filterText.trim().replace(/[^a-z0-9_]/g, '_').toLowerCase();
-  if (trimmed && !_allCollections.some(c => c.name === trimmed)) {
-    ul.innerHTML += `<li class="cb-add-new" onclick="cbCreateNew('${trimmed}')">
-      <span>➕</span><span>Crear "<strong>${trimmed}</strong>"</span>
-    </li>`;
-  }
+function renderCollectionPills() {
+  const strip = document.getElementById('colStrip');
+  if (!strip) return;
+  strip.innerHTML = _allCollections.map(c => {
+    const isActive = c.name === _selectedCollection;
+    const isGeneral = c.name === 'general';
+    const icon = colIconSvg(c.name);
+    return `<div class="col-pill ${isActive ? 'active' : ''}" data-col="${c.name}" onclick="colSelect('${c.name}')">
+      <span class="col-pill-icon">${icon}</span>
+      <span class="col-pill-name">${c.display_name || c.name}</span>
+      <span class="col-pill-actions" onclick="event.stopPropagation()">
+        <button type="button" onclick="openChainConfig('${c.name}')" title="Configurar cadena">
+          <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="2.5"/><path d="M8 1v2m0 10v2M1 8h2m10 0h2m-2.5-5l-1.4 1.4M5.9 10.1L4.5 11.5m0-7L5.9 5.9m4.2 4.2l1.4 1.4"/></svg>
+        </button>
+        ${!isGeneral ? `<button type="button" class="col-del-btn" onclick="colStartDelete('${c.name}')" title="Eliminar coleccion">
+          <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.5"><line x1="4" y1="4" x2="12" y2="12"/><line x1="12" y1="4" x2="4" y2="12"/></svg>
+        </button>` : ''}
+      </span>
+    </div>`;
+  }).join('');
 }
 
-function toggleCombo() {
-  const dd = document.getElementById('cbDropdown');
-  const trigger = document.getElementById('cbTrigger');
-  const search = document.getElementById('cbSearch');
-  const isOpen = dd.style.display !== 'none';
-  dd.style.display = isOpen ? 'none' : '';
-  trigger.classList.toggle('open', !isOpen);
-  if (!isOpen) { renderComboList(); search.value = ''; search.focus(); }
-}
-
-function filterCombo(val) { renderComboList(val); }
-
-function cbSelect(name) {
+function colSelect(name) {
   _selectedCollection = name;
-  document.getElementById('cbValue').textContent = `${cbIcon(name)} ${name}`;
-  document.getElementById('cbDropdown').style.display = 'none';
-  document.getElementById('cbTrigger').classList.remove('open');
-  document.getElementById('newCollectionInput').style.display = 'none';
+  document.querySelectorAll('.col-pill').forEach(p =>
+    p.classList.toggle('active', p.dataset.col === name));
 }
 
-async function cbCreateNew(name) {
-  document.getElementById('cbDropdown').style.display = 'none';
-  document.getElementById('cbTrigger').classList.remove('open');
-  const inp = document.getElementById('newCollectionInput');
-  const field = document.getElementById('collectionName');
-  inp.style.display = 'block';
-  field.value = name;
-  field.focus();
-  _selectedCollection = '__new__';
-  document.getElementById('cbValue').textContent = `➕ ${name}`;
+/* ── Delete collection with inline confirmation ── */
+function colStartDelete(name) {
+  document.querySelectorAll('.col-del-confirm').forEach(el => el.remove());
+  const pill = document.querySelector(`.col-pill[data-col="${name}"]`);
+  if (!pill) return;
+  const overlay = document.createElement('div');
+  overlay.className = 'col-del-confirm';
+  overlay.innerHTML = `Eliminar?
+    <button class="col-del-yes" onclick="event.stopPropagation();colConfirmDelete('${name}')">Si</button>
+    <button class="col-del-no" onclick="event.stopPropagation();colCancelDelete()">No</button>`;
+  pill.appendChild(overlay);
+  setTimeout(() => { if (overlay.parentNode) overlay.remove(); }, 4000);
+}
 
-  // Create in clip bank if available
+function colCancelDelete() {
+  document.querySelectorAll('.col-del-confirm').forEach(el => el.remove());
+}
+
+async function colConfirmDelete(name) {
+  colCancelDelete();
+  try {
+    await apiFetch(`/api/projects/collections/${name}`, { method: 'DELETE' });
+    _allCollections = _allCollections.filter(c => c.name !== name);
+    if (_selectedCollection === name) _selectedCollection = 'general';
+    renderCollectionPills();
+    showToast(`Coleccion "${name}" eliminada`, 'success');
+  } catch (e) {
+    showToast('Error al eliminar coleccion', 'error');
+  }
+}
+
+/* ── Create collection inline ── */
+function colToggleNewInput() {
+  const inp = document.getElementById('colNewInput');
+  const btn = document.getElementById('colAddBtn');
+  const isShown = inp.style.display !== 'none';
+  inp.style.display = isShown ? 'none' : 'inline-flex';
+  btn.style.display = isShown ? 'inline-flex' : 'none';
+  if (!isShown) {
+    const field = document.getElementById('colNewName');
+    field.value = '';
+    field.focus();
+  }
+}
+
+function colCancelNew() {
+  document.getElementById('colNewInput').style.display = 'none';
+  document.getElementById('colAddBtn').style.display = 'inline-flex';
+}
+
+async function colCreateFromInput() {
+  const field = document.getElementById('colNewName');
+  const name = (field.value || '').trim();
+  if (!name || name.length < 2) { showToast('Nombre muy corto (minimo 2 caracteres)', 'error'); return; }
+  if (_allCollections.some(c => c.name === name)) { showToast('Esa coleccion ya existe', 'error'); return; }
   if (_clipBankAvailable) {
     try {
       await apiFetch('/api/projects/collections/create', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name }),
       });
-    } catch (e) {
-      console.warn('[ClipBank] Could not create collection:', e);
-    }
+    } catch (e) { console.warn('[ClipBank] Could not create collection:', e); }
   }
-  // Add to local list
-  if (!_allCollections.some(c => c.name === name)) {
-    _allCollections.push({ name, icon: '📁', display_name: name });
-  }
+  _allCollections.push({ name, display_name: name });
+  _selectedCollection = name;
+  renderCollectionPills();
+  colCancelNew();
+  showToast(`Coleccion "${name}" creada`, 'success');
 }
 
-function cbKeydown(e) {
-  if (e.key === 'Escape') {
-    document.getElementById('cbDropdown').style.display = 'none';
-    document.getElementById('cbTrigger')?.classList.remove('open');
-  } else if (e.key === 'Enter') {
-    const first = document.querySelector('#cbList li');
-    if (first) first.click();
-  }
-}
+/* ── Search Chain Configuration Modal (v2 — categories + percentages) ── */
 
-/* ── Search Chain Configuration Modal ── */
-
-const CHAIN_SOURCES = [
-  { id: 'clip_bank', label: 'Banco de clips local', icon: '🗄️', fixed: 'first' },
-  { id: 'youtube',   label: 'YouTube',              icon: '▶️' },
-  { id: 'pexels',    label: 'Pexels',               icon: '📷' },
-  { id: 'pixabay',   label: 'Pixabay',              icon: '📷' },
-  { id: 'internet_archive', label: 'Internet Archive', icon: '🏛️' },
-  { id: 'nara',      label: 'NARA',                 icon: '🏛️' },
-  { id: 'ai_fallback', label: 'IA Fallback',        icon: '🤖', fixed: 'last' },
-];
+const CHAIN_ICONS = {
+  film: '📹', archive: '🏛️', youtube: '▶️', globe: '🌐', robot: '🤖',
+};
 
 let _chainModalCol = null;
-let _chainOrder = [];
-let _chainEnabled = {};
+let _chainCategories = [];  // array of category objects from server
 
 async function openChainConfig(colName) {
   _chainModalCol = colName;
   try {
     const data = await apiFetch(`/api/projects/collections/${colName}/chain`);
-    const chain = data.search_chain || CHAIN_SOURCES.map(s => s.id);
-    const disabled = data.disabled_sources || [];
-    // Ensure all known sources are in the chain (in case server returned partial list)
-    CHAIN_SOURCES.forEach(s => { if (!chain.includes(s.id)) chain.push(s.id); });
-    _chainOrder = chain;
-    _chainEnabled = {};
-    CHAIN_SOURCES.forEach(s => { _chainEnabled[s.id] = !disabled.includes(s.id); });
+    _chainCategories = JSON.parse(JSON.stringify(data.categories || []));
   } catch (_) {
-    _chainOrder = CHAIN_SOURCES.map(s => s.id);
-    _chainEnabled = {};
-    CHAIN_SOURCES.forEach(s => { _chainEnabled[s.id] = true; });
+    _chainCategories = [];
+  }
+  if (!_chainCategories.length) {
+    showToast('No se pudo cargar la cadena', 'error');
+    return;
   }
   _renderChainList();
   document.getElementById('chainModal').style.display = 'flex';
@@ -1162,39 +1233,89 @@ function _renderChainList() {
   if (!list) return;
   const titleEl = document.getElementById('chainTitle');
   if (titleEl) titleEl.textContent = `Cadena de busqueda — ${_chainModalCol}`;
-  const orderedSources = _chainOrder.map(id => CHAIN_SOURCES.find(s => s.id === id)).filter(Boolean);
-  list.innerHTML = orderedSources.map((s, i) => {
-    const enabled = _chainEnabled[s.id] !== false;
-    const canDrag = !s.fixed;
-    return `<li class="chain-item ${enabled ? '' : 'disabled'} ${s.fixed ? 'fixed' : ''}"
-                data-id="${s.id}" ${canDrag ? 'draggable="true"' : ''}>
-      <button type="button" class="chain-toggle" data-action="toggle" data-sid="${s.id}">${enabled ? '✅' : '❌'}</button>
-      <span class="chain-pos">${i + 1}.</span>
-      <span>${s.icon}</span>
-      <span class="chain-label">${s.label}</span>
-      ${canDrag ? '<span class="chain-grip">⠿</span>' : ''}
+
+  list.innerHTML = _chainCategories.map((cat) => {
+    const enabled = cat.enabled !== false;
+    const icon = CHAIN_ICONS[cat.icon] || '📦';
+    const sourcesText = (cat.sources || []).join(', ');
+    return `<li class="chain-item ${enabled ? '' : 'disabled'}" data-id="${cat.id}">
+      <div class="chain-item-header">
+        <button type="button" class="chain-toggle" data-action="toggle" data-sid="${cat.id}">${enabled ? '✅' : '❌'}</button>
+        <span class="chain-icon">${icon}</span>
+        <span class="chain-label">${cat.label}</span>
+        <span class="chain-pct-value" data-pct-display="${cat.id}">${cat.pct}%</span>
+      </div>
+      ${sourcesText ? `<div class="chain-sources">${sourcesText}</div>` : ''}
+      <div class="chain-slider-row">
+        <input type="range" class="chain-slider" min="0" max="100" value="${cat.pct}"
+               data-slider="${cat.id}" ${enabled ? '' : 'disabled'}>
+      </div>
     </li>`;
   }).join('');
+
+  // Total row
+  const total = _chainCategories.reduce((s, c) => s + (c.enabled !== false ? c.pct : 0), 0);
+  const totalClass = total === 100 ? 'ok' : 'warn';
+  list.insertAdjacentHTML('afterend', '');
+  let totalRow = document.getElementById('chainTotalRow');
+  if (!totalRow) {
+    totalRow = document.createElement('div');
+    totalRow.id = 'chainTotalRow';
+    totalRow.className = 'chain-total-row';
+    list.parentNode.insertBefore(totalRow, list.nextSibling);
+  }
+  totalRow.innerHTML = `Total: <span class="chain-total-value ${totalClass}">${total}%</span>`;
+}
+
+function _onSliderChange(catId, newVal) {
+  const cat = _chainCategories.find(c => c.id === catId);
+  if (!cat || cat.enabled === false) return;
+  cat.pct = parseInt(newVal, 10);
+  // Update display
+  const display = document.querySelector(`[data-pct-display="${catId}"]`);
+  if (display) display.textContent = cat.pct + '%';
+  // Update total
+  const total = _chainCategories.reduce((s, c) => s + (c.enabled !== false ? c.pct : 0), 0);
+  const totalRow = document.getElementById('chainTotalRow');
+  if (totalRow) {
+    const cls = total === 100 ? 'ok' : 'warn';
+    totalRow.innerHTML = `Total: <span class="chain-total-value ${cls}">${total}%</span>`;
+  }
+}
+
+function _equalizePercentages() {
+  const enabled = _chainCategories.filter(c => c.enabled !== false);
+  if (!enabled.length) return;
+  const base = Math.floor(100 / enabled.length);
+  let remainder = 100 - base * enabled.length;
+  enabled.forEach((cat, i) => {
+    cat.pct = base + (i < remainder ? 1 : 0);
+  });
+  _chainCategories.filter(c => c.enabled === false).forEach(c => { c.pct = 0; });
+  _renderChainList();
 }
 
 async function saveChainConfig() {
-  const disabled = Object.entries(_chainEnabled).filter(([, v]) => !v).map(([k]) => k);
   try {
     await apiFetch(`/api/projects/collections/${_chainModalCol}/chain`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ search_chain: _chainOrder, disabled_sources: disabled }),
+      body: JSON.stringify({ version: 2, categories: _chainCategories }),
     });
     showToast('Cadena guardada', 'success');
   } catch (e) {
     showToast('Error al guardar cadena', 'error');
   }
   closeChainModal();
+  // Reload pills if current project uses this collection
+  if (currentProjectId) loadChainPills(_chainModalCol);
 }
 
 function closeChainModal() {
   const m = document.getElementById('chainModal');
   if (m) m.style.display = 'none';
+  const totalRow = document.getElementById('chainTotalRow');
+  if (totalRow) totalRow.remove();
 }
 
 /* ── Chain modal event delegation (set up once) ─────────────────────────── */
@@ -1203,7 +1324,7 @@ function closeChainModal() {
     const modal = document.getElementById('chainModal');
     if (!modal) return;
 
-    // Click delegation — handles toggle, save, cancel, and background close
+    // Click delegation
     modal.addEventListener('click', (e) => {
       // Toggle button
       const toggleBtn = e.target.closest('[data-action="toggle"]');
@@ -1211,11 +1332,18 @@ function closeChainModal() {
         e.preventDefault();
         e.stopPropagation();
         const sid = toggleBtn.dataset.sid;
-        const src = CHAIN_SOURCES.find(s => s.id === sid);
-        if (src && !src.fixed) {
-          _chainEnabled[sid] = !_chainEnabled[sid];
+        const cat = _chainCategories.find(c => c.id === sid);
+        if (cat) {
+          cat.enabled = !cat.enabled;
+          if (!cat.enabled) cat.pct = 0;
           _renderChainList();
         }
+        return;
+      }
+      // Equalize button
+      if (e.target.closest('[data-action="equalize"]')) {
+        e.preventDefault();
+        _equalizePercentages();
         return;
       }
       // Save button
@@ -1236,49 +1364,17 @@ function closeChainModal() {
       }
     });
 
-    // Drag-and-drop delegation
-    let _dragId = null;
-    modal.addEventListener('dragstart', (e) => {
-      const li = e.target.closest('.chain-item[data-id]');
-      if (!li) return;
-      const src = CHAIN_SOURCES.find(s => s.id === li.dataset.id);
-      if (src?.fixed) { e.preventDefault(); return; }
-      _dragId = li.dataset.id;
-      li.classList.add('dragging');
-    });
-    modal.addEventListener('dragend', (e) => {
-      const li = e.target.closest('.chain-item[data-id]');
-      if (li) li.classList.remove('dragging');
-      _dragId = null;
-    });
-    modal.addEventListener('dragover', (e) => { e.preventDefault(); });
-    modal.addEventListener('drop', (e) => {
-      e.preventDefault();
-      const li = e.target.closest('.chain-item[data-id]');
-      if (!li || !_dragId) return;
-      const targetId = li.dataset.id;
-      if (targetId === _dragId) return;
-      const targetSrc = CHAIN_SOURCES.find(s => s.id === targetId);
-      const dragSrc = CHAIN_SOURCES.find(s => s.id === _dragId);
-      if (targetSrc?.fixed || dragSrc?.fixed) return;
-      const fromIdx = _chainOrder.indexOf(_dragId);
-      const toIdx = _chainOrder.indexOf(targetId);
-      if (fromIdx < 0 || toIdx < 0) return;
-      _chainOrder.splice(fromIdx, 1);
-      _chainOrder.splice(toIdx, 0, _dragId);
-      _renderChainList();
+    // Slider input delegation
+    modal.addEventListener('input', (e) => {
+      if (e.target.matches('.chain-slider')) {
+        const catId = e.target.dataset.slider;
+        _onSliderChange(catId, e.target.value);
+      }
     });
   });
 })();
 
-document.addEventListener('click', (e) => {
-  const wrap = document.getElementById('collectionCombo');
-  if (wrap && !wrap.contains(e.target)) {
-    const dd = document.getElementById('cbDropdown');
-    if (dd) dd.style.display = 'none';
-    document.getElementById('cbTrigger')?.classList.remove('open');
-  }
-});
+/* outside click handler removed — pill strip has no dropdown to close */
 
 function handleCollectionChange() { /* legacy no-op */ }
 
@@ -1317,12 +1413,7 @@ async function submitNewVideo(event) {
   // Resolve collection value (stock mode only)
   let collection = 'general';
   if (mode === 'stock') {
-    if (_selectedCollection === '__new__') {
-      const name = (document.getElementById('collectionName').value || '').trim();
-      collection = name || 'general';
-    } else {
-      collection = _selectedCollection || 'general';
-    }
+    collection = _selectedCollection || 'general';
   }
 
   const payload = {
@@ -1345,10 +1436,8 @@ async function submitNewVideo(event) {
     showToast(`Video "${project.title}" creado y en cola`, 'success');
     document.getElementById('newVideoForm').reset();
     document.getElementById('collectionGroup').style.display = 'none';
-    document.getElementById('newCollectionInput').style.display = 'none';
     _selectedCollection = 'general';
-    const cbVal = document.getElementById('cbValue');
-    if (cbVal) cbVal.textContent = '📦 general';
+    renderCollectionPills();
     modeOptions[0].click(); // reset to animated
     typeOptions[0].click(); // reset to top10
     durOptions[0].click();  // reset to 6-8 min
@@ -1441,10 +1530,8 @@ function openVideoPreview(url, sceneNum) {
   const textarea = document.getElementById('videoModalPrompt');
   const saveBtn = document.getElementById('videoModalSaveBtn');
   const regenBtn = document.getElementById('videoModalRegenBtn');
-  player.src = url;
 
   if (_isStockGlobal) {
-    // Stock mode — just show the video, no animation prompt
     label.textContent = `Video — Escena #${sceneNum}`;
     textarea.style.display = 'none';
     if (saveBtn) saveBtn.style.display = 'none';
@@ -1456,7 +1543,14 @@ function openVideoPreview(url, sceneNum) {
     if (saveBtn) saveBtn.style.display = '';
     if (regenBtn) regenBtn.style.display = '';
   }
+
+  // Show modal and stop polling
   modal.style.display = '';
+  stopPolling();
+
+  // Simple direct src — no blob, no fetch
+  player.src = url;
+  player.play().catch(() => {});
 }
 
 async function saveMotionPromptFromModal() {
@@ -1504,8 +1598,13 @@ function closeVideoModal(e) {
   const modal = document.getElementById('videoPreviewModal');
   const player = document.getElementById('videoPreviewPlayer');
   player.pause();
-  player.src = '';
+  player.removeAttribute('src');
   modal.style.display = 'none';
+  // Resume polling after closing the modal
+  if (currentProjectId) {
+    stopPolling();
+    pollInterval = setInterval(() => refreshDetail(currentProjectId), 8000);
+  }
 }
 
 function openImagePreview(url, sceneNum) {
@@ -1842,15 +1941,34 @@ async function sendEditScriptPrompt() {
   }
 }
 
+// ── Copy script text ───────────────────────────────────────────────────────
+
+async function copyScriptText() {
+  const ta = document.getElementById('approvalTextarea');
+  const content = document.getElementById('scriptContent');
+  const text = (ta && ta.style.display !== 'none') ? ta.value : (content ? content.textContent : '');
+  if (!text.trim()) { showToast('No hay texto para copiar', 'error'); return; }
+  try {
+    await navigator.clipboard.writeText(text);
+    showToast('Texto copiado', 'success');
+  } catch (_) {
+    showToast('Error al copiar', 'error');
+  }
+}
+
 // ── Word count ─────────────────────────────────────────────────────────────
 
 function updateWordCount() {
   const ta = document.getElementById('approvalTextarea');
   const countEl = document.getElementById('wordCountVal');
+  const charEl = document.getElementById('charCountVal');
   const container = document.getElementById('scriptWordCount');
   if (!ta || !countEl) return;
-  const words = ta.value.trim() ? ta.value.trim().split(/\s+/).length : 0;
+  const text = ta.value.trim();
+  const words = text ? text.split(/\s+/).length : 0;
+  const chars = ta.value.length;
   countEl.textContent = words.toLocaleString();
+  if (charEl) charEl.textContent = chars.toLocaleString();
   if (container) container.style.display = ta.style.display === 'none' ? 'none' : '';
 }
 
@@ -2837,6 +2955,25 @@ async function searchStockAssets() {
   }
 }
 
+async function recalibrateAudio() {
+  if (!currentProjectId) return;
+  const btn = document.getElementById('btnRecalibrateAudio');
+  const origText = btn ? btn.textContent : '🎯 Recalibrar Audio';
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Recalibrando…'; }
+
+  try {
+    await apiFetch(`/api/projects/${currentProjectId}/recalibrate-timestamps`, { method: 'POST' });
+    showToast('🎯 Recalibración con Whisper iniciada — puede tardar 30-60s…', 'info');
+    stopPolling();
+    await refreshDetail(currentProjectId);
+    pollInterval = setInterval(() => refreshDetail(currentProjectId), 3000);
+  } catch (e) {
+    showToast('Error al recalibrar: ' + e.message, 'error');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = origText; }
+  }
+}
+
 async function retryStockSearch(chunkNumber) {
   if (!currentProjectId) return;
   showToast(`🔍 Rebuscando asset para escena ${chunkNumber}… (puede tardar 30-60s)`, 'info');
@@ -2853,7 +2990,7 @@ async function retryStockSearch(chunkNumber) {
 
     // Poll until the chunk changes (new file or status change)
     let attempts = 0;
-    const maxAttempts = 40; // 40 × 3s = 120s max wait
+    const maxAttempts = 120; // 120 × 3s = 360s max wait (clip_bank downloads can be slow)
     const pollInterval = 3000;
 
     const pollForChange = async () => {
@@ -2907,7 +3044,7 @@ async function retryStockSearch(chunkNumber) {
 function renderAssetTypeFilters() {
   const container = document.getElementById('assetTypeFilters');
   if (!container) return;
-  container.innerHTML = ALL_ASSET_TYPES.map(t => {
+  container.innerHTML = _visiblePills.map(t => {
     const active = _activeAssetTypes.has(t.key) ? 'active' : '';
     return `<span class="atf-chip ${t.key} ${active}" data-type="${t.key}" onclick="toggleAssetFilter('${t.key}')">${t.icon} ${t.label}</span>`;
   }).join('');
@@ -2915,7 +3052,7 @@ function renderAssetTypeFilters() {
 
 function toggleAssetFilter(key) {
   if (_activeAssetTypes.has(key)) {
-    if (_activeAssetTypes.size <= 1) return; // keep at least 1
+    if (_activeAssetTypes.size < 1) return; // allow deselecting all
     _activeAssetTypes.delete(key);
   } else {
     _activeAssetTypes.add(key);
@@ -2953,9 +3090,9 @@ function toggleAssetDropdown(badge, projectId, chunkNumber) {
   if (existing) { existing.remove(); return; }
 
   const types = [
-    { id: 'clip_bank', icon: '🎬', label: 'Clip Bank' },
     { id: 'title_card', icon: '📝', label: 'Titulo' },
-    { id: 'web_image', icon: '🌐', label: 'Img Web' },
+    { id: 'web_image', icon: '🌐', label: 'Imagen Animada' },
+    { id: 'web_image_full', icon: '🖼️', label: 'Imagen Completa' },
     { id: 'stock_video', icon: '📹', label: 'Stock Video' },
     { id: 'ai_image', icon: '🤖', label: 'AI Image' },
     { id: 'archive_footage', icon: '🏛️', label: 'Archivo' },
@@ -3087,6 +3224,7 @@ async function refreshEditing(projectId) {
 
     // Initialize or update canvas player
     _initCanvasPlayer(p.id, chunks);
+    _initPlayerControls();
 
     // Render button state
     const renderBtn = document.getElementById('editingRenderBtn');
@@ -3220,89 +3358,51 @@ const TRANSITIONS = [
 
 let _activeTransitionPopup = null;
 
+// ── Virtual-scrolling timeline ─────────────────────────────────────────────
+// Pre-computed layout data for all items (clips + transition markers)
+let _tlLayout = [];       // [{type:'clip'|'marker', idx, left, width, chunk}]
+let _tlTotalWidth = 0;
+let _tlProject = null;
+let _tlChunks = [];
+let _tlScrollHandler = null;
+const _TL_BUFFER = 300;   // px buffer outside viewport to pre-render
+const _TL_MARKER_W = 22;  // transition marker width in px
+const PX_PER_SEC = 12;
+
 function _buildTimeline(project, chunks) {
   const timeline = document.getElementById('editingTimeline');
   const ruler = document.getElementById('editingTimeRuler');
-  timeline.innerHTML = '';
   if (ruler) ruler.innerHTML = '';
-
-  // Close any open transition popup
   _closeTransitionPopup();
 
-  const PX_PER_SEC = 12;
+  _tlProject = project;
+  _tlChunks = chunks;
+
+  // ── 1. Pre-compute layout positions ───────────────────────────────────
+  _tlLayout = [];
+  let left = 0;
   let accMs = 0;
 
   chunks.forEach((c, idx) => {
-    const n = c.chunk_number;
     const durMs = (c.start_ms != null && c.end_ms != null) ? (c.end_ms - c.start_ms) : 3800;
     const durSec = Math.max(durMs / 1000, 0.5);
     const width = Math.max(Math.round(durSec * PX_PER_SEC), 30);
-    const hasVid = !!c.video_path;
-    const hasImg = !!c.image_path;
 
-    // ── Transition marker BEFORE this clip (not first) ──────────────────
+    // Transition marker before this clip (not first)
     if (idx > 0) {
-      const marker = document.createElement('div');
-      marker.className = 'transition-marker' + (c.transition ? ' has-transition' : '');
-      marker.dataset.chunkNumber = n;
-      marker.dataset.idx = idx;
-      marker.title = c.transition
-        ? `Transición: ${_transitionLabel(c.transition)}`
-        : 'Agregar transición';
-
-      if (c.transition) {
-        const tr = TRANSITIONS.find(t => t.id === c.transition);
-        marker.innerHTML = `<span class="transition-marker-icon">${tr ? tr.icon : '🔄'}</span>`;
-      } else {
-        marker.innerHTML = `<span class="transition-marker-icon">+</span>`;
-      }
-
-      marker.addEventListener('click', (e) => {
-        e.stopPropagation();
-        _openTransitionPopup(marker, project.id, c);
-      });
-      timeline.appendChild(marker);
+      _tlLayout.push({ type: 'marker', idx, left, width: _TL_MARKER_W, chunk: c, accMs });
+      left += _TL_MARKER_W + 2; // 2px gap
     }
 
-    // ── Clip ──────────────────────────────────────────────────────────────
-    const clip = document.createElement('div');
-    clip.className = `timeline-clip ${hasVid ? 'has-video' : hasImg ? '' : 'no-media'}`;
-    clip.style.width = width + 'px';
-    clip.draggable = true;
-    clip.dataset.idx = idx;
-
-    const tlCacheBust = c.updated_at ? `?t=${new Date(c.updated_at).getTime()}` : `?t=${Date.now()}`;
-    let mediaHtml = '';
-    if (hasVid) {
-      mediaHtml = `<video src="/api/projects/${project.id}/chunk/${n}/video${tlCacheBust}" preload="metadata" muted></video>`;
-    } else if (hasImg) {
-      mediaHtml = `<img src="/api/projects/${project.id}/chunk/${n}/image${tlCacheBust}" loading="lazy" />`;
-    } else {
-      mediaHtml = `<div style="width:100%;height:40px;background:var(--bg4);"></div>`;
-    }
-
-    clip.innerHTML = `
-      <span class="timeline-clip-num">${n}</span>
-      ${mediaHtml}
-      <div class="timeline-clip-info"><span>${durSec.toFixed(1)}s</span></div>
-    `;
-
-    clip.addEventListener('click', () => _previewClip(project.id, c));
-    clip.addEventListener('dragstart', _onDragStart);
-    clip.addEventListener('dragover', _onDragOver);
-    clip.addEventListener('dragleave', _onDragLeave);
-    clip.addEventListener('drop', _onDrop);
-    clip.addEventListener('dragend', _onDragEnd);
-
-    timeline.appendChild(clip);
+    _tlLayout.push({ type: 'clip', idx, left, width, chunk: c, accMs, durSec });
+    left += width + 2; // 2px gap
 
     // Ruler tick
     if (ruler) {
       const tick = document.createElement('span');
-      // Account for transition marker width (~20px) in ruler
       if (idx > 0) {
         const spacer = document.createElement('span');
-        spacer.style.width = '20px';
+        spacer.style.width = _TL_MARKER_W + 'px';
         spacer.textContent = '';
         ruler.appendChild(spacer);
       }
@@ -3312,6 +3412,242 @@ function _buildTimeline(project, chunks) {
     }
     accMs += durMs;
   });
+
+  _tlTotalWidth = left;
+
+  // ── 2. Setup virtual-scroll container ─────────────────────────────────
+  // Replace inner HTML with a single spacer + absolutely positioned items
+  timeline.innerHTML = '';
+  timeline.style.position = 'relative';
+
+  const spacer = document.createElement('div');
+  spacer.style.width = _tlTotalWidth + 'px';
+  spacer.style.height = '1px';
+  spacer.style.pointerEvents = 'none';
+  spacer.className = 'tl-spacer';
+  timeline.appendChild(spacer);
+
+  // ── 3. Event delegation ───────────────────────────────────────────────
+  // Remove old handler if any
+  if (_tlScrollHandler) {
+    timeline.removeEventListener('scroll', _tlScrollHandler);
+  }
+  // Remove old delegated listeners
+  timeline.removeEventListener('click', _tlOnClick);
+  timeline.removeEventListener('dragstart', _tlOnDragStart);
+  timeline.removeEventListener('dragover', _tlOnDragOver);
+  timeline.removeEventListener('dragleave', _tlOnDragLeave);
+  timeline.removeEventListener('drop', _tlOnDrop);
+  timeline.removeEventListener('dragend', _tlOnDragEnd);
+
+  // Add delegated listeners
+  timeline.addEventListener('click', _tlOnClick);
+  timeline.addEventListener('dragstart', _tlOnDragStart);
+  timeline.addEventListener('dragover', _tlOnDragOver);
+  timeline.addEventListener('dragleave', _tlOnDragLeave);
+  timeline.addEventListener('drop', _tlOnDrop);
+  timeline.addEventListener('dragend', _tlOnDragEnd);
+
+  // ── 4. Scroll-driven rendering ────────────────────────────────────────
+  _tlScrollHandler = () => _tlRenderVisible(timeline);
+  timeline.addEventListener('scroll', _tlScrollHandler, { passive: true });
+
+  // Initial render
+  _tlRenderVisible(timeline);
+}
+
+// Render only visible items in the timeline viewport
+function _tlRenderVisible(timeline) {
+  const scrollLeft = timeline.scrollLeft;
+  const viewWidth = timeline.clientWidth;
+  const lo = scrollLeft - _TL_BUFFER;
+  const hi = scrollLeft + viewWidth + _TL_BUFFER;
+
+  // Collect which layout items are visible
+  const visibleSet = new Set();
+  for (let i = 0; i < _tlLayout.length; i++) {
+    const item = _tlLayout[i];
+    const itemRight = item.left + item.width;
+    if (itemRight >= lo && item.left <= hi) {
+      visibleSet.add(i);
+    }
+  }
+
+  // Remove DOM nodes no longer visible
+  const existing = timeline.querySelectorAll('[data-tl-i]');
+  existing.forEach(el => {
+    const i = parseInt(el.dataset.tlI);
+    if (!visibleSet.has(i)) {
+      el.remove();
+    } else {
+      visibleSet.delete(i); // already rendered
+    }
+  });
+
+  // Create DOM nodes for newly visible items
+  visibleSet.forEach(i => {
+    const item = _tlLayout[i];
+    const el = _tlCreateElement(item);
+    el.dataset.tlI = i;
+    timeline.appendChild(el);
+  });
+}
+
+// Create a DOM element for a layout item
+function _tlCreateElement(item) {
+  if (item.type === 'marker') {
+    return _tlCreateMarker(item);
+  } else {
+    return _tlCreateClip(item);
+  }
+}
+
+function _tlCreateMarker(item) {
+  const c = item.chunk;
+  const marker = document.createElement('div');
+  marker.className = 'transition-marker' + (c.transition ? ' has-transition' : '');
+  marker.dataset.chunkNumber = c.chunk_number;
+  marker.dataset.idx = item.idx;
+  marker.style.position = 'absolute';
+  marker.style.left = item.left + 'px';
+  marker.style.top = '0';
+  marker.style.height = '100%';
+  marker.title = c.transition
+    ? `Transición: ${_transitionLabel(c.transition)}`
+    : 'Agregar transición';
+
+  if (c.transition) {
+    const tr = TRANSITIONS.find(t => t.id === c.transition);
+    marker.innerHTML = `<span class="transition-marker-icon">${tr ? tr.icon : '🔄'}</span>`;
+  } else {
+    marker.innerHTML = `<span class="transition-marker-icon">+</span>`;
+  }
+  return marker;
+}
+
+function _tlCreateClip(item) {
+  const c = item.chunk;
+  const hasVid = !!c.video_path;
+  const hasImg = !!c.image_path;
+
+  const clip = document.createElement('div');
+  clip.className = `timeline-clip ${hasVid ? 'has-video' : hasImg ? '' : 'no-media'}`;
+  clip.style.width = item.width + 'px';
+  clip.style.position = 'absolute';
+  clip.style.left = item.left + 'px';
+  clip.style.top = '0';
+  clip.draggable = true;
+  clip.dataset.idx = item.idx;
+
+  let mediaHtml = '';
+  if (hasVid) {
+    mediaHtml = `<div style="width:100%;height:40px;background:#1a3a1a;display:flex;align-items:center;justify-content:center;font-size:10px;color:#6f6;">&#9654;</div>`;
+  } else if (hasImg) {
+    mediaHtml = `<div style="width:100%;height:40px;background:#1a1a3a;display:flex;align-items:center;justify-content:center;font-size:10px;color:#66f;">&#9632;</div>`;
+  } else {
+    mediaHtml = `<div style="width:100%;height:40px;background:var(--bg4);"></div>`;
+  }
+
+  clip.innerHTML = `
+    <span class="timeline-clip-num">${c.chunk_number}</span>
+    ${mediaHtml}
+    <div class="timeline-clip-info"><span>${item.durSec.toFixed(1)}s</span></div>
+  `;
+  return clip;
+}
+
+// ── Delegated event handlers for timeline ─────────────────────────────────
+function _tlFindClip(e) {
+  return e.target.closest('.timeline-clip');
+}
+function _tlFindMarker(e) {
+  return e.target.closest('.transition-marker');
+}
+
+function _tlOnClick(e) {
+  const marker = _tlFindMarker(e);
+  if (marker) {
+    e.stopPropagation();
+    const idx = parseInt(marker.dataset.idx);
+    const c = _tlChunks[idx];
+    if (c && _tlProject) _openTransitionPopup(marker, _tlProject.id, c);
+    return;
+  }
+  const clip = _tlFindClip(e);
+  if (clip) {
+    const idx = parseInt(clip.dataset.idx);
+    const c = _tlChunks[idx];
+    if (c && _tlProject) _previewClip(_tlProject.id, c);
+  }
+}
+
+function _tlOnDragStart(e) {
+  const clip = _tlFindClip(e);
+  if (!clip) return;
+  _dragSrcIdx = parseInt(clip.dataset.idx);
+  clip.classList.add('dragging');
+  e.dataTransfer.effectAllowed = 'move';
+  e.dataTransfer.setData('text/plain', _dragSrcIdx);
+}
+
+function _tlOnDragOver(e) {
+  const clip = _tlFindClip(e);
+  if (!clip) return;
+  e.preventDefault();
+  e.dataTransfer.dropEffect = 'move';
+  clip.classList.remove('drag-over-left', 'drag-over-right');
+  const rect = clip.getBoundingClientRect();
+  const midX = rect.left + rect.width / 2;
+  if (e.clientX < midX) clip.classList.add('drag-over-left');
+  else clip.classList.add('drag-over-right');
+}
+
+function _tlOnDragLeave(e) {
+  const clip = _tlFindClip(e);
+  if (clip) clip.classList.remove('drag-over-left', 'drag-over-right');
+}
+
+function _tlOnDrop(e) {
+  const clip = _tlFindClip(e);
+  if (!clip) return;
+  e.preventDefault();
+  clip.classList.remove('drag-over-left', 'drag-over-right');
+  const dstIdx = parseInt(clip.dataset.idx);
+  if (_dragSrcIdx === null || _dragSrcIdx === dstIdx) return;
+
+  const rect = clip.getBoundingClientRect();
+  const midX = rect.left + rect.width / 2;
+  let insertIdx = e.clientX < midX ? dstIdx : dstIdx + 1;
+  if (_dragSrcIdx < insertIdx) insertIdx--;
+
+  const [moved] = _editingChunks.splice(_dragSrcIdx, 1);
+  _editingChunks.splice(insertIdx, 0, moved);
+  _saveClipOrder();
+  const projectId = currentProjectId;
+  apiFetch(`/api/projects/${projectId}`).then(p => {
+    _buildTimeline(p, _editingChunks);
+  });
+}
+
+function _tlOnDragEnd(e) {
+  const clip = _tlFindClip(e);
+  if (clip) clip.classList.remove('dragging');
+  document.querySelectorAll('.timeline-clip').forEach(el => {
+    el.classList.remove('drag-over-left', 'drag-over-right');
+  });
+  _dragSrcIdx = null;
+}
+
+// Scroll timeline to show a specific clip index
+function _tlScrollToClip(idx) {
+  const timeline = document.getElementById('editingTimeline');
+  if (!timeline) return;
+  // Find the clip layout item
+  const item = _tlLayout.find(l => l.type === 'clip' && l.idx === idx);
+  if (!item) return;
+  const viewWidth = timeline.clientWidth;
+  const targetScroll = item.left - viewWidth / 2 + item.width / 2;
+  timeline.scrollTo({ left: Math.max(0, targetScroll), behavior: 'smooth' });
 }
 
 function _transitionLabel(id) {
@@ -3531,47 +3867,177 @@ function _previewClip(projectId, chunk) {
     if (idx >= 0) {
       _canvasPlayer.play(idx);
       _showPlayerControls();
+      // Auto-scroll timeline to show the playing clip
+      _tlScrollToClip(idx);
     }
   }
 
-  // Highlight selected clip
+  // Highlight selected clip (only among currently rendered clips)
   document.querySelectorAll('.timeline-clip.selected').forEach(el => el.classList.remove('selected'));
-  const clips = document.querySelectorAll('.timeline-clip');
-  clips.forEach(el => {
-    if (parseInt(el.querySelector('.timeline-clip-num')?.textContent) === n) el.classList.add('selected');
+  document.querySelectorAll('.timeline-clip').forEach(el => {
+    if (parseInt(el.dataset.idx) === _editingChunks.findIndex(c => c.chunk_number === n)) {
+      el.classList.add('selected');
+    }
   });
 }
 
 // ── Canvas Player Integration ────────────────────────────────────────────
 
-function _initCanvasPlayer(projectId, chunks) {
+async function _initCanvasPlayer(projectId, chunks) {
   const canvas = document.getElementById('editingCanvas');
   if (!canvas) return;
 
-  // Stop previous player
-  if (_canvasPlayer) _canvasPlayer.stop();
+  // Stop & destroy previous player
+  if (_canvasPlayer) {
+    _canvasPlayer.destroy();
+  }
 
+  // Check if preview.mp4 is available — use PreviewPlayer for instant playback
+  try {
+    const status = await apiFetch(`/api/projects/${projectId}/preview-status`);
+    if (status.ready) {
+      const previewUrl = `/api/projects/${projectId}/preview-video`;
+      _canvasPlayer = new PreviewPlayer(canvas, projectId, chunks, previewUrl);
+      _hidePreviewBuildUI();
+      return;
+    }
+  } catch (_) { /* fall through to CanvasPlayer */ }
+
+  // Fallback: multi-clip player
   _canvasPlayer = new CanvasPlayer(canvas, projectId, chunks);
+  _showPreviewBuildUI(projectId);
+}
 
-  // Wire up callbacks
-  _canvasPlayer.onStateChange = (state) => {
-    const btn = document.getElementById('playerPlayBtn');
-    if (!btn) return;
-    btn.innerHTML = state === 'playing' ? '&#9646;&#9646;' : '&#9654;';
-  };
+let _previewPollInterval = null;
 
-  _canvasPlayer.onTimeUpdate = (currentMs, totalMs) => {
-    const el = document.getElementById('playerTimeDisplay');
-    if (el) el.textContent = `${_fmtDuration(currentMs)} / ${_fmtDuration(totalMs)}`;
+function _showPreviewBuildUI(projectId) {
+  const container = document.getElementById('editingPreviewScreen');
+  if (!container) return;
+  // Show "Generate Preview" button if not already present
+  let btn = document.getElementById('buildPreviewBtn');
+  if (!btn) {
+    btn = document.createElement('button');
+    btn.id = 'buildPreviewBtn';
+    btn.className = 'btn btn-primary';
+    btn.style.cssText = 'position:absolute;bottom:10px;right:10px;z-index:20;font-size:12px;padding:6px 14px;';
+    btn.textContent = '🎞️ Generar Preview';
+    btn.onclick = () => _buildPreview(projectId);
+    container.appendChild(btn);
+  }
+}
+
+function _hidePreviewBuildUI() {
+  const btn = document.getElementById('buildPreviewBtn');
+  if (btn) btn.remove();
+  const bar = document.getElementById('previewProgressBar');
+  if (bar) bar.remove();
+  if (_previewPollInterval) { clearInterval(_previewPollInterval); _previewPollInterval = null; }
+}
+
+async function _buildPreview(projectId) {
+  const btn = document.getElementById('buildPreviewBtn');
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Generando…'; }
+
+  try {
+    await apiFetch(`/api/projects/${projectId}/build-preview`, { method: 'POST' });
+  } catch (e) {
+    showToast('Error: ' + e.message, 'error');
+    if (btn) { btn.disabled = false; btn.textContent = '🎞️ Generar Preview'; }
+    return;
+  }
+
+  // Show progress bar
+  const container = document.getElementById('editingPreviewScreen');
+  let bar = document.getElementById('previewProgressBar');
+  if (!bar && container) {
+    bar = document.createElement('div');
+    bar.id = 'previewProgressBar';
+    bar.style.cssText = 'position:absolute;bottom:40px;left:10px;right:10px;z-index:20;height:6px;background:#333;border-radius:3px;';
+    bar.innerHTML = '<div id="previewProgressFill" style="height:100%;width:0%;background:var(--primary,#4f8cff);border-radius:3px;transition:width 0.3s;"></div>';
+    container.appendChild(bar);
+  }
+
+  // Poll for progress
+  if (_previewPollInterval) clearInterval(_previewPollInterval);
+  _previewPollInterval = setInterval(async () => {
+    try {
+      const status = await apiFetch(`/api/projects/${projectId}/preview-status`);
+      const fill = document.getElementById('previewProgressFill');
+      if (fill) fill.style.width = status.progress + '%';
+      if (btn) btn.textContent = `⏳ ${status.progress}%`;
+
+      if (status.ready) {
+        clearInterval(_previewPollInterval);
+        _previewPollInterval = null;
+        showToast('✅ Preview listo', 'success');
+        // Re-init with PreviewPlayer
+        _initCanvasPlayer(projectId, _editingChunks);
+        _initPlayerControls();
+      } else if (status.error) {
+        clearInterval(_previewPollInterval);
+        _previewPollInterval = null;
+        showToast('Error generando preview', 'error');
+        if (btn) { btn.disabled = false; btn.textContent = '🎞️ Reintentar Preview'; }
+        if (bar) bar.remove();
+      }
+    } catch (_) {}
+  }, 2000);
+}
+
+// ── Player Controls Wiring ────────────────────────────────────────
+let _currentPlaybackMs = 0;
+let _totalPlaybackMs = 0;
+let _userSeeking = false;
+let _isPlaying = false;
+let _keyboardListenerAdded = false;
+
+// FIX #1: Helper to clone element, removing ALL old event listeners
+function _cloneClean(id) {
+  const el = document.getElementById(id);
+  if (!el) return null;
+  const clone = el.cloneNode(true);
+  el.parentNode.replaceChild(clone, el);
+  return clone;
+}
+
+function _initPlayerControls() {
+  if (!_canvasPlayer) return;
+
+  // FIX #1: Clone all control elements to strip any old listeners
+  const playBtn   = _cloneClean('playerPlayBtn');
+  const backBtn   = _cloneClean('playerBackBtn');
+  const fwdBtn    = _cloneClean('playerFwdBtn');
+  const seekBar   = _cloneClean('playerSeekBar');
+  const speedSelect = _cloneClean('playerSpeedSelect');
+  const timeDisplay = document.getElementById('playerTimeDisplay');
+
+  if (!playBtn) return;
+
+  // FIX #6: Hide legacy overlay controls so they can't interfere
+  const overlay = document.getElementById('editingPlayerControlsOverlay');
+  if (overlay) overlay.style.display = 'none';
+
+  // Calculate total duration
+  _totalPlaybackMs = (_editingChunks || []).reduce((sum, c) => {
+    return sum + ((c.end_ms != null && c.start_ms != null) ? (c.end_ms - c.start_ms) : 3800);
+  }, 0);
+
+  // Wire up canvas player callbacks (safe to re-set each time)
+  _canvasPlayer.onTimeUpdate = (globalMs, totalMs) => {
+    _currentPlaybackMs = globalMs;
+    if (!_userSeeking && _totalPlaybackMs > 0) {
+      seekBar.value = (globalMs / _totalPlaybackMs) * 1000;
+    }
+    _updateTimeDisplay(timeDisplay);
 
     // Update scrubber bar
-    const pct = totalMs > 0 ? Math.min(currentMs / totalMs, 1) : 0;
+    const pct = totalMs > 0 ? Math.min(globalMs / totalMs, 1) : 0;
     const fill = document.getElementById('timelineScrubberFill');
     const head = document.getElementById('timelinePlayhead');
     const timeEl = document.getElementById('timelineScrubberTime');
     if (fill) fill.style.width = (pct * 100) + '%';
     if (head) head.style.left = (pct * 100) + '%';
-    if (timeEl) timeEl.textContent = _fmtDuration(currentMs);
+    if (timeEl) timeEl.textContent = _fmtDuration(globalMs);
 
     // Move vertical playhead line over clips
     const clipHead = document.getElementById('timelineClipPlayhead');
@@ -3584,14 +4050,95 @@ function _initCanvasPlayer(projectId, chunks) {
     }
   };
 
+  _canvasPlayer.onStateChange = (state) => {
+    _isPlaying = (state === 'playing');
+    playBtn.innerHTML = _isPlaying ? '&#9646;&#9646;' : '&#9654;';
+  };
+
+  _canvasPlayer.onEnd = () => {
+    _isPlaying = false;
+    playBtn.innerHTML = '&#9654;';
+  };
+
   _canvasPlayer.onChunkChange = (idx) => {
-    // Highlight current clip in timeline
     document.querySelectorAll('.timeline-clip.selected').forEach(el => el.classList.remove('selected'));
-    const clips = document.querySelectorAll('.timeline-clip');
-    clips.forEach(el => {
+    document.querySelectorAll('.timeline-clip').forEach(el => {
       if (parseInt(el.dataset.idx) === idx) el.classList.add('selected');
     });
+    _tlScrollToClip(idx);
   };
+
+  // Fresh listeners on cloned elements (guaranteed no duplicates)
+  playBtn.addEventListener('click', () => {
+    if (!_canvasPlayer) return;
+    _canvasPlayer.togglePlayPause();
+  });
+
+  backBtn.addEventListener('click', () => {
+    if (!_canvasPlayer) return;
+    const newMs = Math.max(0, _currentPlaybackMs - 5000);
+    _canvasPlayer.seekTo(newMs);
+  });
+
+  fwdBtn.addEventListener('click', () => {
+    if (!_canvasPlayer) return;
+    const newMs = Math.min(_totalPlaybackMs, _currentPlaybackMs + 5000);
+    _canvasPlayer.seekTo(newMs);
+  });
+
+  seekBar.addEventListener('mousedown', () => { _userSeeking = true; });
+  seekBar.addEventListener('touchstart', () => { _userSeeking = true; }, { passive: true });
+  seekBar.addEventListener('mouseup', () => { _userSeeking = false; });
+  seekBar.addEventListener('touchend', () => { _userSeeking = false; });
+  seekBar.addEventListener('input', () => {
+    if (_canvasPlayer && _totalPlaybackMs > 0) {
+      const ms = (seekBar.value / 1000) * _totalPlaybackMs;
+      _canvasPlayer.seekTo(ms);
+      _currentPlaybackMs = ms;
+      _updateTimeDisplay(timeDisplay);
+    }
+  });
+
+  speedSelect.addEventListener('change', () => {
+    if (_canvasPlayer) {
+      _canvasPlayer.playbackRate = parseFloat(speedSelect.value);
+    }
+  });
+
+  // Keyboard shortcuts — only add once (can't clone document)
+  if (!_keyboardListenerAdded) {
+    _keyboardListenerAdded = true;
+    document.addEventListener('keydown', (e) => {
+      const editingView = document.getElementById('editingView');
+      if (!editingView || editingView.style.display === 'none') return;
+      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') return;
+
+      if (e.code === 'Space') {
+        e.preventDefault();
+        document.getElementById('playerPlayBtn')?.click();
+      } else if (e.code === 'ArrowLeft') {
+        e.preventDefault();
+        document.getElementById('playerBackBtn')?.click();
+      } else if (e.code === 'ArrowRight') {
+        e.preventDefault();
+        document.getElementById('playerFwdBtn')?.click();
+      }
+    });
+  }
+}
+
+function _updateTimeDisplay(el) {
+  if (!el) return;
+  const cur = _formatTime(_currentPlaybackMs);
+  const tot = _formatTime(_totalPlaybackMs);
+  el.textContent = cur + ' / ' + tot;
+}
+
+function _formatTime(ms) {
+  const totalSec = Math.floor(ms / 1000);
+  const min = Math.floor(totalSec / 60);
+  const sec = totalSec % 60;
+  return min + ':' + (sec < 10 ? '0' : '') + sec;
 }
 
 function _showPlayerControls() {
@@ -3616,63 +4163,7 @@ function toggleCanvasPlay() {
   }
 }
 
-// ── Drag & Drop ──────────────────────────────────────────────────────────
-function _onDragStart(e) {
-  _dragSrcIdx = parseInt(e.currentTarget.dataset.idx);
-  e.currentTarget.classList.add('dragging');
-  e.dataTransfer.effectAllowed = 'move';
-  e.dataTransfer.setData('text/plain', _dragSrcIdx);
-}
-
-function _onDragOver(e) {
-  e.preventDefault();
-  e.dataTransfer.dropEffect = 'move';
-  const target = e.currentTarget;
-  target.classList.remove('drag-over-left', 'drag-over-right');
-  const rect = target.getBoundingClientRect();
-  const midX = rect.left + rect.width / 2;
-  if (e.clientX < midX) target.classList.add('drag-over-left');
-  else target.classList.add('drag-over-right');
-}
-
-function _onDragLeave(e) {
-  e.currentTarget.classList.remove('drag-over-left', 'drag-over-right');
-}
-
-function _onDrop(e) {
-  e.preventDefault();
-  const target = e.currentTarget;
-  target.classList.remove('drag-over-left', 'drag-over-right');
-  const dstIdx = parseInt(target.dataset.idx);
-  if (_dragSrcIdx === null || _dragSrcIdx === dstIdx) return;
-
-  // Determine if inserting before or after
-  const rect = target.getBoundingClientRect();
-  const midX = rect.left + rect.width / 2;
-  let insertIdx = e.clientX < midX ? dstIdx : dstIdx + 1;
-  if (_dragSrcIdx < insertIdx) insertIdx--;
-
-  // Reorder array
-  const [moved] = _editingChunks.splice(_dragSrcIdx, 1);
-  _editingChunks.splice(insertIdx, 0, moved);
-
-  // Save new order to backend
-  _saveClipOrder();
-
-  // Rebuild timeline from reordered array
-  const projectId = currentProjectId;
-  apiFetch(`/api/projects/${projectId}`).then(p => {
-    _buildTimeline(p, _editingChunks);
-  });
-}
-
-function _onDragEnd(e) {
-  e.currentTarget.classList.remove('dragging');
-  document.querySelectorAll('.timeline-clip').forEach(el => {
-    el.classList.remove('drag-over-left', 'drag-over-right');
-  });
-  _dragSrcIdx = null;
-}
+// ── Drag & Drop (delegated handlers in _buildTimeline) ──────────────────
 
 async function _saveClipOrder() {
   if (!currentProjectId) return;

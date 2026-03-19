@@ -395,7 +395,7 @@ def _render_image_scene_ffmpeg(
             "-c:v", "libx264",
             "-pix_fmt", "yuv420p",
             "-preset", "fast",
-            "-crf", "23",
+            "-crf", "18",
             "-r", str(fps),
             str(output_path),
         ]
@@ -416,6 +416,70 @@ def _render_image_scene_ffmpeg(
 
     except Exception as exc:
         _safe_print(f"[ImageScene/FFmpeg] Error: {exc}")
+        return False
+
+
+def render_fullscreen_scene(
+    image_path: Path,
+    output_path: Path,
+    duration_seconds: float,
+    zoom_in: bool = True,
+    fps: int = 30,
+) -> bool:
+    """Render image as fullscreen video with alternating zoom in/out.
+
+    zoom_in=True:  1.0 → 1.06 (zoom in)
+    zoom_in=False: 1.06 → 1.0 (zoom out)
+    No blurred background, no frame — image fills entire screen.
+    """
+    try:
+        total_frames = int(duration_seconds * fps)
+        fade_frames = min(10, total_frames // 3)
+        fade_out_start = max(0, total_frames - fade_frames)
+
+        if zoom_in:
+            zoom_expr = f"min(zoom+0.0005,1.06)"
+        else:
+            zoom_expr = f"if(eq(on,1),1.06,max(zoom-0.0005,1.0))"
+
+        vf = (
+            f"scale=1920:1080:force_original_aspect_ratio=increase,"
+            f"crop=1920:1080,"
+            f"zoompan=z='{zoom_expr}':d={total_frames}:s=1920x1080:fps={fps},"
+            f"fade=t=in:st=0:d={fade_frames / fps},"
+            f"fade=t=out:st={fade_out_start / fps}:d={fade_frames / fps}"
+        )
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-loop", "1",
+            "-i", str(image_path),
+            "-t", str(duration_seconds),
+            "-vf", vf,
+            "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",
+            "-preset", "fast",
+            "-crf", "18",
+            "-r", str(fps),
+            str(output_path),
+        ]
+
+        _safe_print(f"[FullscreenScene] Rendering: {image_path.name} ({duration_seconds:.1f}s, {'zoom-in' if zoom_in else 'zoom-out'})")
+
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+
+        if result.returncode != 0:
+            _safe_print(f"[FullscreenScene] Error: {result.stderr[:300]}")
+            return False
+
+        if output_path.exists() and output_path.stat().st_size > 1000:
+            _safe_print(f"[FullscreenScene] OK: {output_path.name}")
+            return True
+
+        return False
+
+    except Exception as exc:
+        _safe_print(f"[FullscreenScene] Error: {exc}")
         return False
 
 
@@ -456,7 +520,7 @@ def _render_with_ffmpeg(
                 "-c:v", "libx264",
                 "-pix_fmt", "yuv420p",
                 "-preset", "fast",
-                "-crf", "23",
+                "-crf", "18",
                 "-r", str(fps),
                 str(output_path),
             ]
@@ -475,7 +539,7 @@ def _render_with_ffmpeg(
                 "-c:v", "libx264",
                 "-pix_fmt", "yuv420p",
                 "-preset", "fast",
-                "-crf", "23",
+                "-crf", "18",
                 str(output_path),
             ]
 

@@ -42,3 +42,20 @@ def transcribe_to_srt(audio_path: Path) -> str:
             response_format="srt",
         )
     return srt_content
+
+
+def transcribe_word_timestamps(audio_path: Path) -> list:
+    """Transcribe audio with word-level timestamps using Whisper API.
+
+    Returns list of dicts: [{"word": "Hello", "start": 0.0, "end": 0.5}, ...]
+    Cost: ~$0.006 per minute of audio.
+    """
+    audio_path = Path(audio_path)
+    with open(audio_path, "rb") as f:
+        result = client.audio.transcriptions.create(
+            model="whisper-1",
+            file=f,
+            response_format="verbose_json",
+            timestamp_granularities=["word"],
+        )
+    return result.words

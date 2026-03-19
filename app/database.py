@@ -5,6 +5,9 @@ from .config import settings
 engine = create_engine(
     settings.database_url,
     connect_args={"check_same_thread": False},
+    pool_size=20,
+    max_overflow=10,
+    pool_timeout=60,
 )
 
 # Enable WAL mode for better concurrent reads

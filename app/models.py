@@ -69,6 +69,8 @@ class Project(Base):
     voiceover_path = Column(String(512), nullable=True)    # path to audio-completo.mp3
     error_message = Column(Text, nullable=True)
     final_video_path = Column(String(512), nullable=True)
+    preview_path = Column(String(512), nullable=True)       # path to preview.mp4
+    preview_progress = Column(Integer, default=0)           # 0-100 preview render %
     render_progress = Column(Integer, default=0)            # 0-100 render %
     collection = Column(String(100), nullable=True, default="general")  # stock footage collection
     created_at = Column(DateTime, default=datetime.utcnow)

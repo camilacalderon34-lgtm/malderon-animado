@@ -8,16 +8,16 @@ from pathlib import Path
 from typing import List
 
 import requests as http_requests
-from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, UploadFile, status
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, Request, UploadFile, status
+from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
 
 from ..database import get_db
 from ..models import Project, Chunk, ProjectStatus, AppSetting
 from ..schemas import ProjectCreate, ProjectOut, ProjectListItem, ScriptApprovalPayload, ResplitPayload, VoiceConfigPayload
 from ..config import PROJECTS_PATH, settings as app_settings
-from ..services.pipeline_service import start_pipeline, start_pipeline_phase2, start_regenerate_script, start_generate_voiceover, start_pipeline_phase3, start_create_scenes_from_srt, start_generate_images, start_stock_asset_search, start_retry_chunk_image, start_generate_motion_prompts, start_animate_scenes, start_regenerate_image_genaipro, start_regenerate_all_genaipro, start_plan_scenes
-from ..services.render_service import start_render_final, render_transition_preview
+from ..services.pipeline_service import start_pipeline, start_pipeline_phase2, start_regenerate_script, start_generate_voiceover, start_pipeline_phase3, start_create_scenes_from_srt, start_generate_images, start_stock_asset_search, start_retry_chunk_image, start_generate_motion_prompts, start_animate_scenes, start_regenerate_image_genaipro, start_regenerate_all_genaipro, start_plan_scenes, start_recalibrate_timestamps
+from ..services.render_service import start_render_final, render_transition_preview, start_preview_render
 from pydantic import BaseModel
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
@@ -115,31 +115,7 @@ def create_project(payload: ProjectCreate, db: Session = Depends(get_db)):
 
 @router.get("/collections/list")
 def list_collections(db: Session = Depends(get_db)):
-    """Fetch collections from clip bank; fall back to local DB."""
-    bank = app_settings.clip_bank_url
-    if bank:
-        try:
-            r = http_requests.get(f"{bank}/api/collections", timeout=(1.5, 5))
-            if r.status_code == 200:
-                data = r.json()
-                # Clip bank returns list of collection objects
-                cols = []
-                for c in data if isinstance(data, list) else data.get("collections", []):
-                    if isinstance(c, dict):
-                        cols.append({
-                            "name": c.get("name", ""),
-                            "icon": c.get("icon", "📁"),
-                            "display_name": c.get("display_name", c.get("name", "")),
-                        })
-                    else:
-                        cols.append({"name": c, "icon": "📁", "display_name": c})
-                # Ensure general exists
-                if not any(c["name"] == "general" for c in cols):
-                    cols.insert(0, {"name": "general", "icon": "📦", "display_name": "general"})
-                return {"collections": cols, "source": "clip_bank"}
-        except Exception:
-            pass
-    # Fallback: local DB
+    """Fetch collections from local DB."""
     rows = (
         db.query(Project.collection)
         .filter(Project.mode == "stock", Project.collection.isnot(None))
@@ -154,55 +130,165 @@ def list_collections(db: Session = Depends(get_db)):
 
 @router.post("/collections/create")
 def create_collection(payload: dict):
-    """Create a new collection in the clip bank."""
-    bank = app_settings.clip_bank_url
-    if not bank:
-        return {"ok": True, "source": "local", "name": payload.get("name", "")}
-    try:
-        r = http_requests.post(f"{bank}/api/collections", json=payload, timeout=10)
-        r.raise_for_status()
-        return {"ok": True, "source": "clip_bank", "data": r.json()}
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Clip bank error: {e}")
+    """Create a new collection (local only)."""
+    return {"ok": True, "source": "local", "name": payload.get("name", "")}
 
 
-_DEFAULT_CHAIN = ["clip_bank", "youtube", "pexels", "pixabay", "internet_archive", "nara", "ai_fallback"]
-_DEFAULT_CHAIN_RESPONSE = {"search_chain": _DEFAULT_CHAIN, "disabled_sources": [], "source": "default"}
+@router.delete("/collections/{col_name}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_collection(col_name: str, db: Session = Depends(get_db)):
+    """Delete a collection. 'general' cannot be deleted.
+    Projects in this collection are reassigned to 'general'."""
+    if col_name == "general":
+        raise HTTPException(status_code=400, detail="Cannot delete the default collection")
+
+    # Reassign projects to "general"
+    db.query(Project).filter(
+        Project.collection == col_name
+    ).update({"collection": "general"}, synchronize_session="fetch")
+
+    # Remove chain config
+    chain_key = _chain_setting_key(col_name)
+    chain_row = db.query(AppSetting).filter(AppSetting.key == chain_key).first()
+    if chain_row:
+        db.delete(chain_row)
+
+    db.commit()
+
+
+_DEFAULT_CHAIN_V2 = {
+    "version": 2,
+    "categories": [
+        {
+            "id": "stock_footage",
+            "label": "Stock Footage",
+            "icon": "film",
+            "sources": ["pexels", "pixabay"],
+            "asset_type": "stock_video",
+            "pct": 30,
+            "enabled": True,
+        },
+        {
+            "id": "archive",
+            "label": "Archive",
+            "icon": "archive",
+            "sources": ["internet_archive", "nara"],
+            "asset_type": "archive_footage",
+            "pct": 10,
+            "enabled": True,
+        },
+        {
+            "id": "youtube",
+            "label": "YouTube",
+            "icon": "youtube",
+            "sources": ["youtube"],
+            "asset_type": "clip_bank",
+            "pct": 40,
+            "enabled": True,
+        },
+        {
+            "id": "web_image",
+            "label": "Imagen Animada",
+            "icon": "globe",
+            "sources": [],
+            "asset_type": "web_image",
+            "pct": 15,
+            "enabled": True,
+        },
+        {
+            "id": "web_image_full",
+            "label": "Imagen Completa",
+            "icon": "globe",
+            "sources": [],
+            "asset_type": "web_image_full",
+            "pct": 0,
+            "enabled": False,
+        },
+        {
+            "id": "ai_fallback",
+            "label": "Imagen IA",
+            "icon": "robot",
+            "sources": [],
+            "asset_type": "ai_image",
+            "pct": 5,
+            "enabled": True,
+        },
+    ],
+}
 
 
 def _chain_setting_key(col_name: str) -> str:
     return f"chain_config_{col_name}"
 
 
-@router.get("/collections/{col_name}/chain")
-def get_collection_chain(col_name: str, db: Session = Depends(get_db)):
-    """Get search chain config for a collection. Tries clip bank first, falls back to local DB."""
-    bank = app_settings.clip_bank_url
-    if bank:
-        try:
-            r = http_requests.get(f"{bank}/api/collections/{col_name}", timeout=(1.5, 5))
-            if r.status_code == 200:
-                return r.json()
-        except Exception:
-            pass  # clip bank offline — fall through to local
+def _migrate_v1_to_v2(data: dict) -> dict:
+    """Convert old v1 chain config (search_chain + disabled_sources) to v2 categories."""
+    if data.get("version") == 2:
+        return data
+    # Old format: {"search_chain": [...], "disabled_sources": [...]}
+    disabled = set(data.get("disabled_sources", []))
+    v2 = json.loads(json.dumps(_DEFAULT_CHAIN_V2))  # deep copy
+    # Map old source ids to category ids
+    source_to_cat = {
+        "youtube": "youtube",
+        "pexels": "stock_footage",
+        "pixabay": "stock_footage",
+        "internet_archive": "archive",
+        "nara": "archive",
+        "ai_fallback": "ai_fallback",
+        "clip_bank": None,  # removed
+    }
+    for cat in v2["categories"]:
+        # Disable category if ALL its sources were disabled in v1
+        cat_sources = cat.get("sources", [])
+        if cat_sources and all(s in disabled for s in cat_sources):
+            cat["enabled"] = False
+        elif cat["id"] == "ai_fallback" and "ai_fallback" in disabled:
+            cat["enabled"] = False
+    return v2
 
-    # Local fallback: read from AppSetting
+
+def _get_chain_config(col_name: str, db: Session) -> dict:
+    """Read chain config for a collection, returning v2 format."""
     row = db.query(AppSetting).filter(AppSetting.key == _chain_setting_key(col_name)).first()
     if row and row.value:
         try:
             data = json.loads(row.value)
-            data["source"] = "local"
-            return data
+            return _migrate_v1_to_v2(data)
         except Exception:
             pass
+    return json.loads(json.dumps(_DEFAULT_CHAIN_V2))
 
-    return _DEFAULT_CHAIN_RESPONSE
+
+def _extract_weights_from_chain(chain: dict) -> tuple:
+    """Extract allowed_types and type_weights from v2 chain config.
+    Returns (allowed_types: list[str], type_weights: dict[str, int])."""
+    allowed_types = []
+    type_weights = {}
+    for cat in chain.get("categories", []):
+        if cat.get("enabled") and cat.get("pct", 0) > 0:
+            at = cat["asset_type"]
+            if at not in allowed_types:
+                allowed_types.append(at)
+            type_weights[at] = type_weights.get(at, 0) + cat["pct"]
+    # Always allow title_card (Claude assigns it contextually, not by percentage)
+    if "title_card" not in allowed_types:
+        allowed_types.append("title_card")
+    return allowed_types, type_weights
+
+
+@router.get("/collections/{col_name}/chain")
+def get_collection_chain(col_name: str, db: Session = Depends(get_db)):
+    """Get search chain config (v2 format) for a collection."""
+    config = _get_chain_config(col_name, db)
+    config["source"] = "local"
+    return config
 
 
 @router.put("/collections/{col_name}/chain")
 def update_collection_chain(col_name: str, payload: dict, db: Session = Depends(get_db)):
-    """Update search chain config. Always saves locally; also syncs to clip bank if available."""
-    # Always persist locally first
+    """Update search chain config (v2 format)."""
+    # Ensure version marker
+    payload["version"] = 2
     key = _chain_setting_key(col_name)
     row = db.query(AppSetting).filter(AppSetting.key == key).first()
     if row:
@@ -210,17 +296,6 @@ def update_collection_chain(col_name: str, payload: dict, db: Session = Depends(
     else:
         db.add(AppSetting(key=key, value=json.dumps(payload)))
     db.commit()
-
-    # Try to sync to clip bank (best-effort)
-    bank = app_settings.clip_bank_url
-    if bank:
-        try:
-            r = http_requests.put(f"{bank}/api/collections/{col_name}", json=payload, timeout=(1.5, 5))
-            if r.status_code == 200:
-                return {**r.json(), "source": "clip_bank"}
-        except Exception:
-            pass  # clip bank offline — local save is enough
-
     return {**payload, "source": "local", "ok": True}
 
 
@@ -582,6 +657,27 @@ def reset_to_audio_approved(project_id: int, db: Session = Depends(get_db)):
     return project
 
 
+@router.post("/{project_id}/recalibrate-timestamps", response_model=ProjectOut)
+def recalibrate_timestamps(project_id: int, db: Session = Depends(get_db)):
+    """Re-sync chunk timestamps using Whisper speech recognition.
+
+    Preserves all chunk data (scene_text, assets, transitions).
+    Only updates start_ms/end_ms and re-slices audio segments.
+    """
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    chunks = db.query(Chunk).filter(Chunk.project_id == project_id).all()
+    if not chunks:
+        raise HTTPException(status_code=400, detail="No hay chunks para recalibrar")
+    if not project.voiceover_path:
+        raise HTTPException(status_code=400, detail="No hay voiceover generado")
+
+    start_recalibrate_timestamps(project.id)
+    return project
+
+
 @router.post("/{project_id}/regenerate-voiceover", response_model=ProjectOut)
 def regenerate_voiceover_endpoint(project_id: int, db: Session = Depends(get_db)):
     """Discard current voiceover and go back to voice configuration."""
@@ -669,15 +765,20 @@ class PlanScenesPayload(BaseModel):
 
 @router.post("/{project_id}/plan-scenes", response_model=ProjectOut)
 def plan_scenes(project_id: int, payload: PlanScenesPayload = None, db: Session = Depends(get_db)):
-    """Run visual analysis on all scenes to assign asset types (no download)."""
+    """Run visual analysis on all scenes to assign asset types (no download).
+    Reads category percentages from the collection's chain config."""
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
     if project.status not in (ProjectStatus.scenes_ready, ProjectStatus.images_ready, ProjectStatus.error):
         raise HTTPException(status_code=400, detail="El proyecto no está en un estado válido para planificar escenas")
 
-    allowed = (payload.allowed_types if payload and payload.allowed_types else [])
-    start_plan_scenes(project.id, allowed_types=allowed)
+    # Read chain config for this collection and extract weights
+    col_name = project.collection or "general"
+    chain = _get_chain_config(col_name, db)
+    allowed_types, type_weights = _extract_weights_from_chain(chain)
+
+    start_plan_scenes(project.id, allowed_types=allowed_types, type_weights=type_weights)
     db.refresh(project)
     return project
 
@@ -698,7 +799,7 @@ def update_chunk_asset_type(
     ).first()
     if not chunk:
         raise HTTPException(status_code=404, detail="Chunk no encontrado")
-    valid_types = ("clip_bank", "stock_video", "title_card", "web_image", "ai_image", "archive_footage", "space_media")
+    valid_types = ("clip_bank", "stock_video", "title_card", "web_image", "web_image_full", "ai_image", "archive_footage", "space_media")
     if payload.asset_type not in valid_types:
         raise HTTPException(status_code=400, detail=f"Tipo inválido. Válidos: {valid_types}")
     old_type = chunk.asset_type
@@ -750,8 +851,8 @@ def get_chunk_image(project_id: int, chunk_number: int, db: Session = Depends(ge
 
 
 @router.get("/{project_id}/chunk/{chunk_number}/video")
-def get_chunk_video(project_id: int, chunk_number: int, db: Session = Depends(get_db)):
-    """Serve the generated video for a specific scene chunk."""
+def get_chunk_video(project_id: int, chunk_number: int, request: Request, db: Session = Depends(get_db)):
+    """Serve the generated video for a specific scene chunk (supports Range requests)."""
     chunk = db.query(Chunk).filter(
         Chunk.project_id == project_id,
         Chunk.chunk_number == chunk_number,
@@ -763,8 +864,47 @@ def get_chunk_video(project_id: int, chunk_number: int, db: Session = Depends(ge
     vid_path = Path(chunk.video_path)
     if not vid_path.exists():
         raise HTTPException(status_code=404, detail=f"Archivo de video no encontrado: {chunk.video_path}")
+
+    file_size = vid_path.stat().st_size
+    range_header = request.headers.get("range")
+
+    if range_header:
+        # Parse Range: bytes=start-end
+        range_spec = range_header.replace("bytes=", "")
+        parts = range_spec.split("-")
+        start = int(parts[0]) if parts[0] else 0
+        end = int(parts[1]) if parts[1] else file_size - 1
+        end = min(end, file_size - 1)
+        content_length = end - start + 1
+
+        def iter_file():
+            with open(vid_path, "rb") as f:
+                f.seek(start)
+                remaining = content_length
+                while remaining > 0:
+                    chunk_size = min(8192, remaining)
+                    data = f.read(chunk_size)
+                    if not data:
+                        break
+                    remaining -= len(data)
+                    yield data
+
+        return StreamingResponse(
+            iter_file(),
+            status_code=206,
+            media_type="video/mp4",
+            headers={
+                "Content-Range": f"bytes {start}-{end}/{file_size}",
+                "Accept-Ranges": "bytes",
+                "Content-Length": str(content_length),
+                "Cache-Control": "no-cache, must-revalidate",
+            },
+        )
+
+    # No Range header — return full file
     return FileResponse(str(vid_path), media_type="video/mp4",
-                        headers={"Cache-Control": "no-cache, must-revalidate"})
+                        headers={"Accept-Ranges": "bytes",
+                                 "Cache-Control": "no-cache, must-revalidate"})
 
 
 @router.post("/{project_id}/retry-chunk-image/{chunk_number}", response_model=ProjectOut)
@@ -1097,6 +1237,107 @@ def get_final_video(project_id: int, db: Session = Depends(get_db)):
     if not path.exists():
         raise HTTPException(status_code=404, detail="Archivo de video no encontrado")
     return FileResponse(str(path), media_type="video/mp4", filename=f"{project.slug}_final.mp4")
+
+
+# ── Preview Video ─────────────────────────────────────────────────────────
+
+@router.post("/{project_id}/build-preview")
+def build_preview(project_id: int, db: Session = Depends(get_db)):
+    """Launch fast preview video generation in background."""
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    has_media = (
+        db.query(Chunk)
+        .filter(
+            Chunk.project_id == project_id,
+            (Chunk.video_path != None) | (Chunk.image_path != None),  # noqa: E711
+        )
+        .first()
+    )
+    if not has_media:
+        raise HTTPException(status_code=400, detail="Ninguna escena tiene video o imagen")
+
+    project.preview_progress = 0
+    project.preview_path = None
+    db.commit()
+
+    start_preview_render(project.id)
+    return {"ok": True, "message": "Preview generation started"}
+
+
+@router.get("/{project_id}/preview-status")
+def preview_status(project_id: int, db: Session = Depends(get_db)):
+    """Check if preview video is ready."""
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    ready = False
+    if project.preview_path:
+        p = Path(project.preview_path)
+        ready = p.exists()
+
+    return {
+        "ready": ready,
+        "progress": project.preview_progress or 0,
+        "error": project.preview_progress == -1,
+    }
+
+
+@router.get("/{project_id}/preview-video")
+def get_preview_video(project_id: int, request: Request, db: Session = Depends(get_db)):
+    """Serve the preview video with Range request support."""
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if not project.preview_path:
+        raise HTTPException(status_code=404, detail="No hay preview generado")
+    vid_path = Path(project.preview_path)
+    if not vid_path.exists():
+        raise HTTPException(status_code=404, detail="Archivo de preview no encontrado")
+
+    file_size = vid_path.stat().st_size
+    range_header = request.headers.get("range")
+
+    if range_header:
+        range_spec = range_header.replace("bytes=", "")
+        parts = range_spec.split("-")
+        start = int(parts[0]) if parts[0] else 0
+        end = int(parts[1]) if parts[1] else file_size - 1
+        end = min(end, file_size - 1)
+        content_length = end - start + 1
+
+        def iter_file():
+            with open(vid_path, "rb") as f:
+                f.seek(start)
+                remaining = content_length
+                while remaining > 0:
+                    chunk_size = min(8192, remaining)
+                    data = f.read(chunk_size)
+                    if not data:
+                        break
+                    remaining -= len(data)
+                    yield data
+
+        return StreamingResponse(
+            iter_file(),
+            status_code=206,
+            media_type="video/mp4",
+            headers={
+                "Content-Range": f"bytes {start}-{end}/{file_size}",
+                "Accept-Ranges": "bytes",
+                "Content-Length": str(content_length),
+                "Cache-Control": "no-cache",
+            },
+        )
+
+    return FileResponse(
+        str(vid_path),
+        media_type="video/mp4",
+        headers={"Accept-Ranges": "bytes", "Cache-Control": "no-cache"},
+    )
 
 
 # ── Reference Images (character + style) ──────────────────────────────────

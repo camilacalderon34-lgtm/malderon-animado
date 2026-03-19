@@ -76,7 +76,7 @@ def render_transition_preview(
                 "-i", str(src_a),
                 "-t", f"{CLIP_DUR:.3f}",
                 "-vf", vf,
-                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                "-c:v", "libx264", "-preset", "fast", "-crf", "18",
                 "-r", "30", "-an", "-pix_fmt", "yuv420p",
                 str(clip_a),
             ])
@@ -99,7 +99,7 @@ def render_transition_preview(
             "-i", str(src_b),
             "-t", f"{CLIP_DUR:.3f}",
             "-vf", vf,
-            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "18",
             "-r", "30", "-an", "-pix_fmt", "yuv420p",
             str(clip_b),
         ])
@@ -171,7 +171,7 @@ def _normalize_clip(
             "-i", str(src),
             "-t", f"{target_dur:.3f}",
             "-vf", vf,
-            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "18",
             "-r", "30", "-an", "-pix_fmt", "yuv420p",
             str(dst),
         ])
@@ -187,7 +187,7 @@ def _normalize_clip(
             "-i", str(src),
             "-t", f"{target_dur:.3f}",
             "-vf", vf,
-            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "18",
             "-r", "30", "-an", "-pix_fmt", "yuv420p",
             str(dst),
         ])
@@ -199,7 +199,7 @@ def _normalize_clip(
             "-i", str(src),
             "-t", f"{target_dur:.3f}",
             "-vf", vf,
-            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "18",
             "-r", "30", "-an", "-pix_fmt", "yuv420p",
             str(dst),
         ])
@@ -213,7 +213,7 @@ def _image_to_video(src: Path, dst: Path, dur: float, w: int = 1920, h: int = 10
         "-i", str(src),
         "-t", f"{dur:.3f}",
         "-vf", vf,
-        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
         "-r", "30", "-pix_fmt", "yuv420p",
         str(dst),
     ])
@@ -224,7 +224,7 @@ def _black_placeholder(dst: Path, dur: float, w: int = 1920, h: int = 1080) -> N
     _run_ffmpeg([
         "-f", "lavfi",
         "-i", f"color=c=black:s={w}x{h}:r=30:d={dur:.3f}",
-        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
         "-pix_fmt", "yuv420p",
         str(dst),
     ])
@@ -343,7 +343,7 @@ def _xfade_batch(
         *inputs,
         "-filter_complex_script", filter_file.name,
         "-map", "[vout]",
-        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
         "-r", "30", "-pix_fmt", "yuv420p",
         "-movflags", "+faststart",
         out.name,
@@ -564,7 +564,7 @@ def _run_render_final(project_id: int) -> None:
             "-i", "voiceover.mp3",
             "-map", "0:v", "-map", "1:a",
             "-c:v", "copy",
-            "-c:a", "aac", "-b:a", "192k",
+            "-c:a", "aac", "-b:a", "256k",
             "-shortest",
             "-movflags", "+faststart",
             "final_video.mp4",
@@ -609,6 +609,155 @@ def _run_render_final(project_id: int) -> None:
             _log(db, project_id,
                  f"❌ Error en renderizado: {exc}\n{traceback.format_exc()}",
                  stage="render_error", level="error")
+        except Exception:
+            pass
+    finally:
+        db.close()
+
+
+# ── Preview render (fast, low-res, no transitions) ───────────────────────────
+
+def _set_preview_progress(db, project, pct: int):
+    """Update preview_progress on the project (0-100)."""
+    pct = max(0, min(100, int(pct)))
+    project.preview_progress = pct
+    db.commit()
+
+
+def start_preview_render(project_id: int):
+    """Launch preview video render in a background daemon thread."""
+    t = threading.Thread(target=_run_preview_render, args=(project_id,), daemon=True)
+    t.start()
+
+
+def _run_preview_render(project_id: int) -> None:
+    """Generate a fast preview.mp4 — low-res concat + voiceover mix."""
+    db = SessionLocal()
+    try:
+        project = db.query(Project).filter(Project.id == project_id).first()
+        if not project:
+            return
+
+        project.preview_progress = 0
+        project.preview_path = None
+        db.commit()
+
+        slug = project.slug
+        _log(db, project_id, "🎞️ Generando preview rápido…", stage="preview")
+
+        p_dir = project_dir(slug)
+        tmp_dir = p_dir / "preview_tmp"
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir)
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+
+        chunks = (
+            db.query(Chunk)
+            .filter(Chunk.project_id == project_id)
+            .order_by(Chunk.chunk_number)
+            .all()
+        )
+        if not chunks:
+            raise RuntimeError("No hay escenas para preview.")
+
+        vo_path = (
+            Path(project.voiceover_path)
+            if project.voiceover_path
+            else voiceover_dir(slug) / "audio-completo.mp3"
+        )
+
+        total = len(chunks)
+
+        # ── Stage 1: Prepare clips at low resolution ──────────────────────
+        clip_paths: list[Path] = []
+        for i, chunk in enumerate(chunks):
+            out = tmp_dir / f"clip_{chunk.chunk_number:04d}.mp4"
+
+            if chunk.start_ms is not None and chunk.end_ms is not None:
+                target = max((chunk.end_ms - chunk.start_ms) / 1000.0, 0.5)
+            else:
+                target = 5.0
+
+            video_src = Path(chunk.video_path) if chunk.video_path else None
+            image_src = Path(chunk.image_path) if chunk.image_path else None
+
+            if video_src and video_src.exists():
+                _normalize_clip(video_src, out, target, width=960, height=540)
+            elif image_src and image_src.exists():
+                _image_to_video(image_src, out, target, w=960, h=540)
+            else:
+                _black_placeholder(out, target, w=960, h=540)
+
+            clip_paths.append(out)
+            pct = int((i + 1) / total * 70)
+            _set_preview_progress(db, project, pct)
+
+        # ── Stage 2: Fast concat (no transitions) ────────────────────────
+        _set_preview_progress(db, project, 72)
+        concat_list = tmp_dir / "concat_list.txt"
+        concat_content = "\n".join(f"file {p.name}" for p in clip_paths)
+        concat_list.write_bytes(concat_content.encode("ascii"))
+
+        video_only = tmp_dir / "video_only.mp4"
+        _run_ffmpeg([
+            "-f", "concat", "-safe", "0",
+            "-i", "concat_list.txt",
+            "-c", "copy",
+            "-movflags", "+faststart",
+            "video_only.mp4",
+        ], cwd=tmp_dir, timeout=1800)
+        _set_preview_progress(db, project, 85)
+
+        # ── Stage 3: Mix voiceover ────────────────────────────────────────
+        preview_local = tmp_dir / "preview.mp4"
+        if vo_path.exists():
+            vo_local = tmp_dir / "voiceover.mp3"
+            shutil.copy2(str(vo_path), str(vo_local))
+            _run_ffmpeg([
+                "-i", "video_only.mp4",
+                "-i", "voiceover.mp3",
+                "-map", "0:v", "-map", "1:a",
+                "-c:v", "copy",
+                "-c:a", "aac", "-b:a", "128k",
+                "-shortest",
+                "-movflags", "+faststart",
+                "preview.mp4",
+            ], cwd=tmp_dir, timeout=1800)
+        else:
+            shutil.copy2(str(video_only), str(preview_local))
+
+        _set_preview_progress(db, project, 95)
+
+        # ── Move to final location ────────────────────────────────────────
+        final_preview = p_dir / "preview.mp4"
+        shutil.move(str(preview_local), str(final_preview))
+
+        project.preview_path = str(final_preview)
+        project.preview_progress = 100
+        db.commit()
+
+        size_mb = final_preview.stat().st_size / (1024 * 1024)
+        _log(db, project_id,
+             f"✅ Preview listo: {size_mb:.1f} MB",
+             stage="preview_done")
+
+        # Cleanup tmp
+        try:
+            shutil.rmtree(tmp_dir)
+        except Exception:
+            pass
+
+    except Exception as exc:
+        db.rollback()
+        db.expire_all()
+        project = db.query(Project).filter(Project.id == project_id).first()
+        if project:
+            project.preview_progress = -1  # signal error
+            db.commit()
+        try:
+            _log(db, project_id,
+                 f"❌ Error en preview: {exc}\n{traceback.format_exc()}",
+                 stage="preview_error", level="error")
         except Exception:
             pass
     finally:

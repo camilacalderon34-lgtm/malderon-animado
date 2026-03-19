@@ -1,5 +1,5 @@
 """AI service - script generation, image prompts, keyword extraction.
-Uses OpenRouter (openai-compatible) instead of Anthropic directly.
+Uses Anthropic SDK directly with Claude models.
 """
 import json
 import re
@@ -48,30 +48,55 @@ def _safe_print(msg: str) -> None:
     except Exception:
         pass
 
-# Using Anthropic SDK for direct API access
-client = Anthropic(api_key=settings.anthropic_api_key)
+# Anthropic SDK (unused now, kept for reference)
+# client = Anthropic(api_key=settings.anthropic_api_key)
 
-# Removed: Anthropic direct client (no credits)
+# OpenRouter client for fast API calls (scene division)
+from openai import OpenAI as _OpenAI
+_openrouter = _OpenAI(
+    api_key=settings.openrouter_api_key,
+    base_url="https://openrouter.ai/api/v1",
+)
+
 
 # Model aliases
-_MODEL_FAST  = "google/gemini-2.0-flash-lite-001"  # cheap + fast (JSON tasks, image prompts)
-_MODEL_SMART = "google/gemini-2.0-flash-001"        # quality (scripts, editing)
+_MODEL_FAST  = "claude-haiku-4-5-20251001"  # cheap + fast (JSON tasks, image prompts)
+_MODEL_SMART = "claude-sonnet-4-5"              # quality (scripts, editing)
 
 
 def _chat(system: str, user: str, model: str = _MODEL_SMART, max_tokens: int = 8192) -> str:
-    """Call OpenRouter with a system + user message. Returns the text response."""
-    resp = client.messages.create(
-        model=model,
-        max_tokens=max_tokens,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user",   "content": user},
-        ],
-    )
-    content = resp.choices[0].message.content
-    if content is None:
-        raise RuntimeError("OpenRouter returned empty content (None)")
-    return content.strip()
+    """Call Claude via OpenRouter API (fast, no subprocess overhead).
+
+    Falls back to Claude CLI stdin if OpenRouter fails.
+    Model mapping: claude-sonnet-4-5 → anthropic/claude-sonnet-4-5
+                   claude-haiku-4-5-... → anthropic/claude-haiku-4-5-20251001
+    """
+    # Map model aliases to OpenRouter format
+    _model_map = {
+        "claude-sonnet-4-5": "anthropic/claude-sonnet-4-5",
+        "claude-haiku-4-5-20251001": "anthropic/claude-haiku-4-5-20251001",
+    }
+    or_model = _model_map.get(model, f"anthropic/{model}")
+
+    for attempt in range(1, 4):
+        try:
+            resp = _openrouter.chat.completions.create(
+                model=or_model,
+                max_tokens=max_tokens,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                timeout=180,
+            )
+            text = resp.choices[0].message.content
+            if not text or not text.strip():
+                raise RuntimeError("OpenRouter returned empty output")
+            return text.strip()
+        except Exception as e:
+            _safe_print(f"[OpenRouter] Error attempt {attempt}/3: {str(e)[:200]}")
+            import time; time.sleep(2)
+    raise RuntimeError("OpenRouter failed after 3 attempts")
 
 # ── Root path (two levels up from this file: app/services/ → root) ────────────
 _ROOT = Path(__file__).resolve().parent.parent.parent
@@ -374,7 +399,7 @@ def generate_script_from_outline(outline: str, duration: str = "6-8") -> str:
 
 # ── Scene division with SRT timestamps ───────────────────────────────────────
 
-_MODEL_SCENE_DIVISION = "claude-sonnet-4-5"  # Sonnet via OpenRouter
+_MODEL_SCENE_DIVISION = "anthropic/claude-sonnet-4-5"  # Sonnet via OpenRouter
 _SCENE_CHUNK_WORDS = 3000  # split script into chunks of this many words for long videos
 
 
@@ -531,14 +556,16 @@ def _repair_numbered_scenes(scenes: list) -> list:
 
         if _is_numbered_entry(scene["texto"]):
             needs_repair = False
+            has_title_boundary = _find_title_end(scene["texto"]) is not None
 
-            # Case 1: text ends with a hanging word
-            if _HANGING_ENDS.search(scene["texto"]):
+            # Case 1: text ends with a hanging word BUT only if there's no
+            # valid title boundary already (e.g. "Sort Of." has boundary → complete)
+            if not has_title_boundary and _HANGING_ENDS.search(scene["texto"]):
                 needs_repair = True
 
             # Case 2: no title boundary found (no : or . after the number+title)
             # This means the title was cut short: "Number 5, The Train"
-            if not needs_repair and _find_title_end(scene["texto"]) is None:
+            if not needs_repair and not has_title_boundary:
                 # Check if the text is short (likely an incomplete title)
                 word_count = len(scene["texto"].split())
                 if word_count < 12:  # Short numbered entry without boundary = likely incomplete
@@ -567,7 +594,32 @@ def _repair_numbered_scenes(scenes: list) -> list:
     if repairs > 0:
         _safe_print(f"[SceneDivision] Repaired {repairs} split numbered entries")
 
-    return result
+    # After repair merges, force-split titles from explanations again
+    # E.g. repair merged "Number 5, The Train" + "Goes Off. Details..." into
+    # "Number 5, The Train Goes Off. Details..." → split into title + detail scenes
+    final = []
+    for scene in result:
+        txt = scene["texto"]
+        if _is_numbered_entry(txt):
+            title_end = _find_title_end(txt)
+            if title_end is not None:
+                title = txt[:title_end].strip()
+                detail = txt[title_end:].strip()
+                if detail:
+                    total_ms = scene["endMs"] - scene["startMs"]
+                    total_words = len(txt.split())
+                    title_words = len(title.split())
+                    # Proportional time split based on word count
+                    ratio = title_words / total_words if total_words > 0 else 0.3
+                    title_dur = int(total_ms * ratio)
+                    split_ms = scene["startMs"] + title_dur
+                    final.append({**scene, "texto": title, "endMs": split_ms})
+                    final.append({**scene, "texto": detail, "startMs": split_ms})
+                    _safe_print(f"[SceneDivision] Post-repair split: '{title[:50]}' | '{detail[:50]}'")
+                    continue
+        final.append(scene)
+
+    return final
 
 
 def _parse_srt_entries_full(srt_text: str) -> list:
@@ -610,9 +662,9 @@ def _build_word_timestamps(entries: list) -> list:
 
 def _divide_text_with_haiku(full_text: str, total_duration_s: float, wps: float,
                             mode: str = "animated") -> list:
-    """Send continuous narration text to Claude Sonnet (Anthropic direct). Returns list of scene text strings."""
+    """Send continuous narration text to Claude Sonnet (OpenRouter). Returns list of scene text strings."""
     total_words = len(full_text.split())
-    print(f"[SceneDivision] model={_MODEL_SCENE_DIVISION} (Anthropic direct), mode={mode}, words={total_words}, dur={total_duration_s:.1f}s")
+    print(f"[SceneDivision] model={_MODEL_SCENE_DIVISION} (OpenRouter), mode={mode}, words={total_words}, dur={total_duration_s:.1f}s")
     print(f"[SceneDivision] STOCK PROMPT: {'YES' if mode == 'stock' else 'NO (animated)'}")
 
     target_min_s = 4
@@ -663,11 +715,12 @@ def _divide_text_with_haiku(full_text: str, total_duration_s: float, wps: float,
             "Step 4: Verify every scene has a clear visual identity — if you can't picture a stock clip for it, the cut is wrong.\n\n"
             "=== CRITICAL RULE FOR NUMBERED LISTS/COUNTDOWN ===\n"
             "If the script contains list numbers (Number 1, Number 2, Fact #10, #9, etc.):\n"
-            "- EVERY NUMBER is a MANDATORY HARD CUT. The previous scene MUST end before the number begins.\n"
-            "- The number title MUST be in the same scene as the number. NEVER separate them.\n"
-            "- CORRECT: \"Number 3, The Brazilian Setting That Was Never Brazil:\"\n"
-            "- WRONG: \"Number 3,\" then \"The Brazilian Setting That Was Never Brazil:\"\n"
-            "- After the title scene, divide the content into 4-7 second scenes normally.\n\n"
+            "- EVERY NUMBER + TITLE must be its OWN SEPARATE SCENE, without the explanation.\n"
+            "- The title ends at the first '.' or ':' after the number phrase.\n"
+            "- The explanation/detail that follows goes in the NEXT scene(s).\n"
+            "- CORRECT: Scene 1 = 'Number 3, The Brazilian Setting That Was Never Brazil.' | Scene 2 = 'The actual filming took place in...'\n"
+            "- WRONG: Scene 1 = 'Number 3, The Brazilian Setting That Was Never Brazil. The actual filming took place in...'\n"
+            "- After the title scene, divide the explanation into 4-7 second scenes normally.\n\n"
             "=== EXAMPLE ===\n"
             f"Speaking rate: {wps:.2f} words/sec → 4s ≈ {int(4*wps)} words, 7s ≈ {int(7*wps)} words\n\n"
             "Script: \"Fast Five, released in 2011, is arguably the most pivotal movie in the Fast and Furious franchise, "
@@ -744,11 +797,12 @@ def _divide_text_with_haiku(full_text: str, total_duration_s: float, wps: float,
     print(f"[SceneDivision] Prompt has visual-coherence rules: {_has_visual_rules}")
     print(f"[SceneDivision] Prompt first 300 chars: {user_prompt[:300]}")
 
-    resp = client.messages.create(
-        model=_MODEL_SCENE_DIVISION,
+    _safe_print(f"[SceneDivision] Calling Sonnet via OpenRouter...")
+    resp = _openrouter.chat.completions.create(
+        model="anthropic/claude-sonnet-4-5",
         max_tokens=16000,
-        system=system_prompt,
         messages=[
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
     )
@@ -761,6 +815,29 @@ def _divide_text_with_haiku(full_text: str, total_duration_s: float, wps: float,
         raise ValueError(f"Expected JSON array of strings, got: {type(scenes)}")
 
     return scenes
+
+
+def _force_split_numbered_titles(scene_texts: list) -> list:
+    """Force-split any numbered entry where title + explanation are in the same scene.
+
+    E.g. "Number 1: The Boulder Was Real. The opening temple..." becomes:
+      - "Number 1: The Boulder Was Real."
+      - "The opening temple..."
+    """
+    result = []
+    for text in scene_texts:
+        if _is_numbered_entry(text):
+            title_end = _find_title_end(text)
+            if title_end is not None:
+                title = text[:title_end].strip()
+                detail = text[title_end:].strip()
+                if detail:
+                    _safe_print(f"[PostProc] Split numbered title: '{title[:50]}' | detail: '{detail[:50]}'")
+                    result.append(title)
+                    result.append(detail)
+                    continue
+        result.append(text)
+    return result
 
 
 def _postprocess_scenes(scene_texts: list, wps: float, mode: str = "animated") -> list:
@@ -777,6 +854,9 @@ def _postprocess_scenes(scene_texts: list, wps: float, mode: str = "animated") -
         return NUMBERED_MAX_DUR if _is_numbered_entry(text) else MAX_DUR
 
     scenes = list(scene_texts)
+
+    # Force-split numbered titles BEFORE merge/split cycles
+    scenes = _force_split_numbered_titles(scenes)
 
     # Run up to 10 full cycles of merge+split until everything is clean
     for _cycle in range(10):
@@ -830,6 +910,25 @@ def _merge_short_scenes(scenes: list, min_words: int) -> list:
             text = scenes[i]
             wc = len(text.split())
             if wc < min_words and len(scenes) > 1:
+                # Bare number without title (e.g. "Number 14.") → merge forward
+                # Check this FIRST because _is_numbered_entry won't match bare
+                # numbers (it requires trailing content with a space).
+                bare_m = re.match(
+                    r"^\s*(?:Number\s+\d+|#\s*\d+|\d{1,2})\s*[,:.]\s*$",
+                    text,
+                    re.IGNORECASE,
+                )
+                if bare_m and i + 1 < len(scenes):
+                    scenes[i + 1] = text.rstrip() + " " + scenes[i + 1].lstrip()
+                    changed = True
+                    i += 1
+                    continue
+                # Numbered entries with a title (e.g. "Number 5. The Title.")
+                # are intentionally short — keep them.
+                if _is_numbered_entry(text):
+                    result.append(text)
+                    i += 1
+                    continue
                 changed = True
                 if i + 1 < len(scenes):
                     # If next scene starts with a numbered entry, merge into previous instead
@@ -1015,3 +1114,109 @@ def _map_scenes_to_timestamps(scene_texts: list, word_timestamps: list) -> list:
         word_idx = end_idx
 
     return scenes
+
+
+# ── Whisper recalibration ────────────────────────────────────────────────────
+
+import re as _re
+import unicodedata as _ud
+
+
+def _normalize_word(w: str) -> str:
+    """Lowercase, strip punctuation, normalize unicode for fuzzy comparison."""
+    w = _ud.normalize("NFKD", w).lower()
+    return _re.sub(r"[^\w]", "", w)
+
+
+def recalibrate_chunk_timestamps(
+    chunks_data: list[dict],
+    whisper_words: list,
+) -> list[dict]:
+    """Align existing chunk scene_texts to Whisper word-level timestamps.
+
+    Strategy: for each chunk, find its first words in the Whisper stream
+    using fuzzy matching around a proportional expected position.
+    Each chunk's end_ms = next chunk's start_ms (or audio end for last).
+    """
+    from difflib import SequenceMatcher
+
+    # Flatten Whisper words
+    w_norms = []
+    w_times = []
+    for w in whisper_words:
+        word_text = w.word if hasattr(w, "word") else w.get("word", "")
+        start = w.start if hasattr(w, "start") else w.get("start", 0)
+        end = w.end if hasattr(w, "end") else w.get("end", 0)
+        w_norms.append(_normalize_word(word_text))
+        w_times.append({"start_ms": int(start * 1000), "end_ms": int(end * 1000)})
+
+    if not w_times:
+        return [
+            {"chunk_number": c["chunk_number"], "start_ms": 0, "end_ms": 0}
+            for c in chunks_data
+        ]
+
+    total_scene = sum(len(c["scene_text"].split()) for c in chunks_data)
+    total_w = len(w_norms)
+
+    # ── Pass 1: find anchor for each chunk ──────────────────────────────────
+    anchors = []
+    cum_words = 0
+    min_pos = 0  # Enforce monotonically non-decreasing anchors
+
+    for chunk in chunks_data:
+        scene_words = chunk["scene_text"].split()
+        n_words = len(scene_words)
+        scene_norms = [_normalize_word(w) for w in scene_words]
+
+        # Expected position (proportional hint)
+        expected_i = int(cum_words / max(total_scene, 1) * total_w)
+        expected_i = max(expected_i, min_pos)
+        expected_i = min(expected_i, total_w - 1)
+
+        # Search window: only forward from min_pos, up to +30 from expected
+        search_lo = max(min_pos, expected_i - 15)
+        search_hi = min(total_w, expected_i + 30)
+
+        # Match first 3 scene words against Whisper stream
+        match_n = min(3, len(scene_norms))
+        target = " ".join(scene_norms[:match_n])
+
+        best_pos = expected_i
+        best_score = -1
+
+        for pos in range(search_lo, search_hi):
+            available = min(match_n, total_w - pos)
+            if available < 1:
+                break
+            candidate = " ".join(w_norms[pos + j] for j in range(available))
+            score = SequenceMatcher(None, target, candidate).ratio()
+            if score > best_score:
+                best_score = score
+                best_pos = pos
+            if score > 0.9:
+                break
+
+        anchors.append(best_pos)
+        min_pos = best_pos + 1  # Next chunk must start after this one
+        cum_words += n_words
+
+    # ── Pass 2: build results ───────────────────────────────────────────────
+    audio_end_ms = w_times[-1]["end_ms"]
+    results = []
+
+    for i, chunk in enumerate(chunks_data):
+        start_ms = w_times[anchors[i]]["start_ms"]
+        if i + 1 < len(anchors):
+            end_ms = w_times[anchors[i + 1]]["start_ms"]
+        else:
+            end_ms = audio_end_ms
+        end_ms = max(start_ms, end_ms)
+
+        results.append({
+            "chunk_number": chunk["chunk_number"],
+            "start_ms": start_ms,
+            "end_ms": end_ms,
+        })
+
+    return results

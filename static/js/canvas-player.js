@@ -1,36 +1,25 @@
 /**
- * CanvasPlayer — Real-time video player with transitions + voiceover.
- *
- * Plays an ordered list of chunks on a <canvas>, rendering xfade-style
- * transitions between clips entirely in the browser (no FFmpeg needed).
- * Syncs voiceover audio to the playback position.
+ * PreviewPlayer — Plays a single concatenated preview.mp4 with native controls.
+ * Tracks which chunk is active based on video.currentTime vs chunk offsets.
+ * Same callback interface as CanvasPlayer so app.js works with either.
  */
-class CanvasPlayer {
-  constructor(canvas, projectId, chunks) {
+class PreviewPlayer {
+  constructor(canvas, projectId, chunks, previewUrl) {
     this.canvas = canvas;
-    this.ctx = canvas.getContext('2d');
     this.projectId = projectId;
     this.chunks = chunks;
-
-    this.mediaA = null;
-    this.mediaB = null;
     this.currentIdx = 0;
     this.state = 'idle';
-    this.rafId = null;
-    this._chunkStartTime = 0;
-    this._currentDurMs = 0;
-    this._pausedElapsed = 0;
+    this.playbackRate = 1;
 
-    // Voiceover audio element
-    this.audio = null;
-    this._audioLoaded = false;
+    this.container = document.getElementById('editingPreviewScreen');
 
-    // Callbacks
     this.onStateChange = null;
     this.onTimeUpdate = null;
     this.onChunkChange = null;
+    this.onEnd = null;
 
-    // Precompute cumulative offsets (ms) for each chunk
+    // Build offsets (cumulative ms) for chunk tracking
     this._offsets = [];
     let acc = 0;
     for (const c of chunks) {
@@ -39,42 +28,244 @@ class CanvasPlayer {
     }
     this.totalDurMs = acc;
 
-    // Start loading voiceover
-    this._loadAudio();
+    // Create the single video element
+    this._video = null;
+    this._previewUrl = previewUrl;
+    this._setupVideo();
   }
 
-  // ── Public API ────────────────────────────────────────────────────────
+  _durOf(c) {
+    return (c.start_ms != null && c.end_ms != null) ? (c.end_ms - c.start_ms) : 3800;
+  }
+
+  _setupVideo() {
+    if (!this.container) return;
+
+    // Hide placeholder/canvas
+    const placeholder = document.getElementById('editingPreviewPlaceholder');
+    if (placeholder) placeholder.style.display = 'none';
+    if (this.canvas) this.canvas.style.display = 'none';
+    const oldVid = document.getElementById('editingPreviewPlayer');
+    if (oldVid) oldVid.style.display = 'none';
+
+    // Remove any existing cp-active elements
+    this.container.querySelectorAll('video.cp-active, img.cp-active').forEach(el => el.remove());
+
+    const vid = document.createElement('video');
+    vid.className = 'cp-active cp-preview';
+    vid.controls = true;
+    vid.autoplay = false;
+    vid.playsInline = true;
+    vid.preload = 'auto';
+    vid.style.cssText = 'width:100%;height:100%;object-fit:contain;position:absolute;top:0;left:0;z-index:5;background:#000;';
+    vid.src = this._previewUrl;
+    this.container.appendChild(vid);
+    this._video = vid;
+
+    // Track time updates for chunk highlighting
+    vid.addEventListener('timeupdate', () => {
+      if (!this._video) return;
+      const currentMs = this._video.currentTime * 1000;
+      if (this.onTimeUpdate) {
+        this.onTimeUpdate(currentMs, this.totalDurMs);
+      }
+      // Find which chunk we're in
+      let idx = 0;
+      for (let i = this._offsets.length - 1; i >= 0; i--) {
+        if (currentMs >= this._offsets[i]) { idx = i; break; }
+      }
+      if (idx !== this.currentIdx) {
+        this.currentIdx = idx;
+        if (this.onChunkChange) this.onChunkChange(idx);
+      }
+    });
+
+    vid.addEventListener('play', () => {
+      this.state = 'playing';
+      if (this.onStateChange) this.onStateChange(this.state);
+    });
+
+    vid.addEventListener('pause', () => {
+      if (this._video && this._video.ended) return;
+      this.state = 'paused';
+      if (this.onStateChange) this.onStateChange(this.state);
+    });
+
+    vid.addEventListener('ended', () => {
+      this.state = 'idle';
+      if (this.onStateChange) this.onStateChange(this.state);
+      if (this.onEnd) this.onEnd();
+    });
+  }
+
+  play(fromIdx = 0) {
+    if (!this._video) return;
+    const seekMs = this._offsets[fromIdx] || 0;
+    this._video.currentTime = seekMs / 1000;
+    this._video.playbackRate = this.playbackRate;
+    this._video.play().catch(() => {});
+    this.currentIdx = fromIdx;
+    if (this.onChunkChange) this.onChunkChange(fromIdx);
+  }
+
+  pause() {
+    if (this._video) this._video.pause();
+  }
+
+  resume() {
+    if (!this._video) return;
+    this._video.playbackRate = this.playbackRate;
+    this._video.play().catch(() => {});
+  }
+
+  togglePlayPause() {
+    if (!this._video) return;
+    if (this._video.paused || this._video.ended) {
+      this._video.playbackRate = this.playbackRate;
+      this._video.play().catch(() => {});
+    } else {
+      this._video.pause();
+    }
+  }
+
+  stop() {
+    if (this._video) {
+      this._video.pause();
+      this._video.currentTime = 0;
+    }
+    this.state = 'idle';
+    if (this.onStateChange) this.onStateChange(this.state);
+  }
+
+  seekTo(ms) {
+    if (!this._video) return;
+    this._video.currentTime = Math.max(0, Math.min(ms, this.totalDurMs)) / 1000;
+  }
+
+  seekToTransition(chunkNumber) {
+    const arrIdx = this.chunks.findIndex(c => c.chunk_number === chunkNumber);
+    if (arrIdx <= 0) return;
+    const seekMs = Math.max(0, (this._offsets[arrIdx - 1] || 0) + this._durOf(this.chunks[arrIdx - 1]) - 1500);
+    this.seekTo(seekMs);
+    if (this._video && this._video.paused) {
+      this._video.playbackRate = this.playbackRate;
+      this._video.play().catch(() => {});
+    }
+  }
+
+  updateChunks(chunks) {
+    this.chunks = chunks;
+    this._offsets = [];
+    let acc = 0;
+    for (const c of chunks) { this._offsets.push(acc); acc += this._durOf(c); }
+    this.totalDurMs = acc;
+  }
+
+  destroy() {
+    if (this._video) {
+      this._video.pause();
+      this._video.src = '';
+      this._video.load();
+      this._video.remove();
+      this._video = null;
+    }
+  }
+}
+
+
+/**
+ * CanvasPlayer — Fallback sequential clip player (used when preview.mp4 isn't available).
+ * Creates FRESH <video> elements per clip with blob caching.
+ */
+class CanvasPlayer {
+  constructor(canvas, projectId, chunks) {
+    this.canvas = canvas;
+    this.projectId = projectId;
+    this.chunks = chunks;
+    this.currentIdx = 0;
+    this.state = 'idle';
+    this._timerInterval = null;
+    this._advanceTimeout = null;
+    this._loadingMedia = false;
+
+    this.container = document.getElementById('editingPreviewScreen');
+
+    this.audio = null;
+    this._audioLoaded = false;
+    this.playbackRate = 1;
+    this.onStateChange = null;
+    this.onTimeUpdate = null;
+    this.onChunkChange = null;
+    this.onEnd = null;
+
+    // For resume: track when chunk started and how far we were
+    this._chunkStartedAt = 0;   // performance.now() when chunk playback began
+    this._chunkSeekMs = 0;      // seekMs used when starting this chunk
+    this._chunkDurMsCurrent = 0; // duration of current chunk
+
+    // ── Blob cache for instant transitions ──
+    this._blobCache = new Map();    // idx → blobUrl
+    this._fetching = new Set();     // idx currently being fetched
+    this.PREFETCH_AHEAD = 5;        // how many clips to cache ahead
+    this.CACHE_BEHIND = 3;          // keep this many behind current
+
+    // ── Offsets for timeline progress ──
+    this._offsets = [];
+    let acc = 0;
+    for (const c of chunks) {
+      this._offsets.push(acc);
+      acc += this._durOf(c);
+    }
+    this.totalDurMs = acc;
+
+    this._loadAudio();
+  }
 
   play(fromIdx = 0) {
     this.stop();
     this.currentIdx = fromIdx;
     this.state = 'playing';
-    this._pausedElapsed = 0;
-    this._showCanvas();
     this._fireStateChange();
+    this._prefetchAround(fromIdx);
+    // Sync audio ONCE at play start — audio is master clock from here on
+    const startMs = this.chunks[fromIdx]?.start_ms ?? this._offsets[fromIdx] ?? 0;
+    this._syncAudioTo(startMs);
     this._startChunk(fromIdx, 0);
+    this._startUITimer(); // Timer runs continuously for entire playback
   }
 
   pause() {
     if (this.state !== 'playing') return;
     this.state = 'paused';
-    this._pausedElapsed = performance.now() - this._chunkStartTime;
-    if (this.rafId) { cancelAnimationFrame(this.rafId); this.rafId = null; }
-    if (this.mediaA && this.mediaA.tagName === 'VIDEO') this.mediaA.pause();
-    if (this.mediaB && this.mediaB.tagName === 'VIDEO') this.mediaB.pause();
+
+    const vid = this.container ? this.container.querySelector('video.cp-active') : null;
+    if (vid) vid.pause();
     if (this.audio) this.audio.pause();
+
+    this._clearAdvanceTimeout();
+    this._stopUITimer();
+
     this._fireStateChange();
   }
 
   resume() {
     if (this.state !== 'paused') return;
     this.state = 'playing';
-    this._chunkStartTime = performance.now() - this._pausedElapsed;
-    if (this.mediaA && this.mediaA.tagName === 'VIDEO') this.mediaA.play().catch(() => {});
-    if (this.mediaB && this.mediaB.tagName === 'VIDEO') this.mediaB.play().catch(() => {});
-    if (this.audio) this.audio.play().catch(() => {});
+
+    const vid = this.container ? this.container.querySelector('video.cp-active') : null;
+    if (vid) {
+      vid.playbackRate = this.playbackRate;
+      vid.play().catch(() => {});
+    }
+    if (this.audio) {
+      this.audio.playbackRate = this.playbackRate;
+      this.audio.play().catch(() => {});
+    }
+
+    // Audio-driven timer handles advancement — no need for advance timeout
+    this._startUITimer();
+
     this._fireStateChange();
-    this._renderFrame();
   }
 
   togglePlayPause() {
@@ -85,53 +276,52 @@ class CanvasPlayer {
 
   stop() {
     this.state = 'idle';
-    if (this.rafId) { cancelAnimationFrame(this.rafId); this.rafId = null; }
-    this._destroyMedia(this.mediaA);
-    this._destroyMedia(this.mediaB);
-    this.mediaA = null;
-    this.mediaB = null;
-    if (this.audio) { this.audio.pause(); }
+    this._loadingMedia = false;
+    this._clearAdvanceTimeout();
+    this._stopUITimer();
+    this._removeAllMedia();
+    if (this.audio) this.audio.pause();
     this._fireStateChange();
   }
 
   seekToTransition(chunkNumber) {
     const arrIdx = this.chunks.findIndex(c => c.chunk_number === chunkNumber);
     if (arrIdx <= 0) return;
-    this.stop();
-    this.currentIdx = arrIdx - 1;
-    this.state = 'playing';
-    const prevDur = this._chunkDurMs(arrIdx - 1);
-    const seekMs = Math.max(0, prevDur - 1500);
-    this._showCanvas();
-    this._fireStateChange();
-    this._startChunk(arrIdx - 1, seekMs);
+    const seekMs = Math.max(0, (this._offsets[arrIdx - 1] || 0) + this._durOf(this.chunks[arrIdx - 1]) - 1500);
+    this.seekTo(seekMs);
   }
 
   seekTo(ms) {
     const targetMs = Math.max(0, Math.min(ms, this.totalDurMs));
-    // Find which chunk contains this time
     let idx = 0;
     for (let i = this._offsets.length - 1; i >= 0; i--) {
       if (targetMs >= this._offsets[i]) { idx = i; break; }
     }
     this.stop();
-    this.currentIdx = idx;
     this.state = 'playing';
-    const offsetInChunk = targetMs - this._offsets[idx];
-    this._showCanvas();
     this._fireStateChange();
-    this._startChunk(idx, offsetInChunk);
+    // Sync audio to target position
+    this._syncAudioTo(targetMs);
+    this._prefetchAround(idx);
+    this._startChunk(idx, targetMs - this._offsets[idx]);
+    this._startUITimer(); // Timer runs continuously
   }
 
   updateChunks(chunks) {
     this.chunks = chunks;
     this._offsets = [];
     let acc = 0;
-    for (const c of chunks) {
-      this._offsets.push(acc);
-      acc += this._durOf(c);
-    }
+    for (const c of chunks) { this._offsets.push(acc); acc += this._durOf(c); }
     this.totalDurMs = acc;
+  }
+
+  destroy() {
+    this.stop();
+    for (const [, url] of this._blobCache) {
+      URL.revokeObjectURL(url);
+    }
+    this._blobCache.clear();
+    this._fetching.clear();
   }
 
   // ── Audio ─────────────────────────────────────────────────────────────
@@ -144,41 +334,37 @@ class CanvasPlayer {
     this.audio.load();
   }
 
-  _syncAudio(globalMs) {
-    if (!this.audio || !this._audioLoaded) return;
-    const targetSec = globalMs / 1000;
-    // Only seek if drift > 300ms
-    if (Math.abs(this.audio.currentTime - targetSec) > 0.3) {
-      this.audio.currentTime = targetSec;
+  // Get current audio position in ms (master clock), or null if unavailable
+  _getAudioMs() {
+    if (this.audio && this.audio.readyState >= 2 && !isNaN(this.audio.currentTime)) {
+      return this.audio.currentTime * 1000;
     }
-    if (this.state === 'playing' && this.audio.paused) {
-      this.audio.play().catch(() => {});
+    return null;
+  }
+
+  _syncAudioTo(ms) {
+    if (!this.audio) return;
+    const doSync = () => {
+      this.audio.currentTime = ms / 1000;
+      this.audio.playbackRate = this.playbackRate;
+      if (this.state === 'playing') {
+        this.audio.play().catch(() => {});
+      }
+    };
+    if (this._audioLoaded || this.audio.readyState >= 1) {
+      doSync();
+    } else {
+      // Wait for audio to be ready, then sync
+      const onReady = () => {
+        this.audio.removeEventListener('canplay', onReady);
+        this._audioLoaded = true;
+        doSync();
+      };
+      this.audio.addEventListener('canplay', onReady);
     }
   }
 
-  // ── Internal ──────────────────────────────────────────────────────────
-
-  _durOf(c) {
-    return (c.start_ms != null && c.end_ms != null) ? (c.end_ms - c.start_ms) : 3800;
-  }
-
-  _showCanvas() {
-    this.canvas.style.display = '';
-    const parent = this.canvas.parentElement;
-    if (parent) {
-      this.canvas.width = parent.clientWidth || 960;
-      this.canvas.height = parent.clientHeight || 540;
-    }
-    const placeholder = document.getElementById('editingPreviewPlaceholder');
-    if (placeholder) placeholder.style.display = 'none';
-    const videoEl = document.getElementById('editingPreviewPlayer');
-    if (videoEl) { videoEl.pause(); videoEl.style.display = 'none'; }
-  }
-
-  _chunkDurMs(idx) {
-    const c = this.chunks[idx];
-    return c ? this._durOf(c) : 0;
-  }
+  // ── Blob Cache ──────────────────────────────────────────────────────
 
   _chunkMediaUrl(chunk) {
     const cb = chunk.updated_at ? `?t=${new Date(chunk.updated_at).getTime()}` : `?t=${Date.now()}`;
@@ -187,319 +373,497 @@ class CanvasPlayer {
     return null;
   }
 
-  _isVideo(chunk) { return !!chunk.video_path; }
+  // FIX #4: Determine if chunk is image-only (no video_path)
+  _isImageOnly(chunk) {
+    return !chunk.video_path && !!chunk.image_path;
+  }
 
-  async _loadMedia(chunk) {
+  _fetchBlob(idx) {
+    if (idx < 0 || idx >= this.chunks.length) return;
+    if (this._blobCache.has(idx) || this._fetching.has(idx)) return;
+
+    const chunk = this.chunks[idx];
     const url = this._chunkMediaUrl(chunk);
-    if (!url) {
-      const c = document.createElement('canvas');
-      c.width = 16; c.height = 9;
-      const x = c.getContext('2d');
-      x.fillStyle = '#000'; x.fillRect(0, 0, 16, 9);
-      const img = new Image();
-      img.src = c.toDataURL();
-      await img.decode().catch(() => {});
-      img._isStatic = true;
-      return img;
-    }
+    if (!url) return;
 
-    if (this._isVideo(chunk)) {
-      const vid = document.createElement('video');
-      vid.crossOrigin = 'anonymous';
-      vid.muted = true;  // muted because audio comes from voiceover
-      vid.playsInline = true;
-      vid.preload = 'auto';
-      vid.src = url;
-      vid._isStatic = false;
-      await new Promise((resolve) => {
-        vid.oncanplaythrough = resolve;
-        vid.onerror = resolve;
-        setTimeout(resolve, 8000);
+    this._fetching.add(idx);
+    fetch(url)
+      .then(r => r.blob())
+      .then(blob => {
+        this._fetching.delete(idx);
+        if (!this._blobCache.has(idx)) {
+          this._blobCache.set(idx, URL.createObjectURL(blob));
+        }
+      })
+      .catch(() => {
+        this._fetching.delete(idx);
       });
-      return vid;
-    } else {
-      const img = new Image();
-      img.crossOrigin = 'anonymous';
-      img.src = url;
-      img._isStatic = true;
-      await img.decode().catch(() => {});
-      return img;
+  }
+
+  _prefetchAround(idx) {
+    for (let i = 0; i < this.PREFETCH_AHEAD; i++) {
+      this._fetchBlob(idx + i);
+    }
+    this._cleanupCache(idx);
+  }
+
+  _cleanupCache(currentIdx) {
+    for (const [cachedIdx, url] of this._blobCache) {
+      if (cachedIdx < currentIdx - this.CACHE_BEHIND) {
+        URL.revokeObjectURL(url);
+        this._blobCache.delete(cachedIdx);
+      }
     }
   }
 
-  _destroyMedia(el) {
-    if (!el) return;
-    if (el.tagName === 'VIDEO') {
-      el.pause();
-      el.removeAttribute('src');
-      el.load();
-    }
+  _getBestUrl(idx) {
+    if (this._blobCache.has(idx)) return this._blobCache.get(idx);
+    const chunk = this.chunks[idx];
+    return chunk ? this._chunkMediaUrl(chunk) : null;
   }
 
-  async _startChunk(idx, seekMs = 0) {
+  // ── Internal ──────────────────────────────────────────────────────────
+
+  _durOf(c) {
+    return (c.start_ms != null && c.end_ms != null) ? (c.end_ms - c.start_ms) : 3800;
+  }
+
+  _chunkDurMs(idx) {
+    return this.chunks[idx] ? this._durOf(this.chunks[idx]) : 0;
+  }
+
+  _createVideoEl(url) {
+    const vid = document.createElement('video');
+    vid.className = 'cp-active';
+    vid.controls = false;
+    vid.autoplay = false;
+    vid.muted = true;
+    vid.playsInline = true;
+    vid.preload = 'auto';
+    vid.style.cssText = 'width:100%;height:100%;object-fit:contain;position:absolute;top:0;left:0;z-index:5;background:#000;';
+    vid.src = url;
+    return vid;
+  }
+
+  // FIX #4: Create <img> element for image-only chunks
+  _createImageEl(url) {
+    const img = document.createElement('img');
+    img.className = 'cp-active';
+    img.style.cssText = 'width:100%;height:100%;object-fit:contain;position:absolute;top:0;left:0;z-index:5;background:#000;';
+    img.src = url;
+    return img;
+  }
+
+  // FIX #5: Properly clean up both video and img elements
+  _removeAllMedia() {
+    if (!this.container) return;
+    this.container.querySelectorAll('video.cp-active, img.cp-active').forEach(el => {
+      if (el.tagName === 'VIDEO') {
+        el.pause();
+        el.oncanplay = null;
+        el.onended = null;
+        el.onerror = null;
+        // FIX #5: Use load() to properly reset instead of removeAttribute('src')
+        el.src = '';
+        el.load();
+      }
+      el.remove();
+    });
+  }
+
+  _startChunk(idx, seekMs = 0) {
+    this._clearAdvanceTimeout();
+
     if (idx >= this.chunks.length) {
-      // Finished all clips
       if (this.audio) this.audio.pause();
       this.state = 'idle';
+      this._stopUITimer();
+      this._loadingMedia = false;
       this._fireStateChange();
+      if (this.onEnd) this.onEnd();
       return;
+    }
+
+    // ── Skip-ahead: if audio already passed this chunk, jump to correct one ──
+    const audioNow = this._getAudioMs();
+    if (audioNow != null) {
+      for (let i = this.chunks.length - 1; i > idx; i--) {
+        const cs = this.chunks[i].start_ms ?? this._offsets[i] ?? Infinity;
+        if (audioNow >= cs) { idx = i; break; }
+      }
     }
 
     this.currentIdx = idx;
-    this._currentDurMs = this._chunkDurMs(idx);
     if (this.onChunkChange) this.onChunkChange(idx);
 
-    // Load current if needed
-    if (!this.mediaA) {
-      this.mediaA = await this._loadMedia(this.chunks[idx]);
-    }
+    const chunk = this.chunks[idx];
+    const url = this._getBestUrl(idx);
+    const chunkDur = this._chunkDurMs(idx);
+    const chunkStartMs = chunk.start_ms ?? this._offsets[idx] ?? 0;
 
-    // Preload next
-    if (idx + 1 < this.chunks.length) {
-      this._loadMedia(this.chunks[idx + 1]).then(m => { this.mediaB = m; });
-    } else {
-      this.mediaB = null;
-    }
+    this._chunkDurMsCurrent = chunkDur;
 
-    // Start video playback
-    if (this.mediaA && this.mediaA.tagName === 'VIDEO') {
-      this.mediaA.currentTime = seekMs / 1000;
-      this.mediaA.play().catch(() => {});
-    }
-
-    // Sync voiceover audio
-    const globalMs = (this._offsets[idx] || 0) + seekMs;
-    this._syncAudio(globalMs);
-
-    this._chunkStartTime = performance.now() - seekMs;
-    this._pausedElapsed = 0;
-
-    // Start render loop
-    if (this.rafId) cancelAnimationFrame(this.rafId);
-    this._renderFrame();
-  }
-
-  _renderFrame() {
-    if (this.state !== 'playing') return;
-
-    const now = performance.now();
-    const elapsed = now - this._chunkStartTime;
-    const chunkDur = this._currentDurMs;
-    const nextChunk = (this.currentIdx + 1 < this.chunks.length)
-      ? this.chunks[this.currentIdx + 1] : null;
-    const trType = nextChunk?.transition || null;
-    const trDur = trType ? (nextChunk.transition_duration || 500) : 0;
-
-    const ctx = this.ctx;
-    const w = this.canvas.width;
-    const h = this.canvas.height;
-
-    if (elapsed >= chunkDur) {
-      // Chunk finished → advance
-      this._advanceToNext();
+    if (!this.container || !url) {
+      // No media — use fallback timeout, timer handles audio-driven advancement
+      this._loadingMedia = false;
+      this._chunkStartedAt = performance.now();
+      this._chunkSeekMs = 0;
+      const remainMs = Math.max(50, chunkDur / this.playbackRate);
+      this._advanceTimeout = setTimeout(() => {
+        if (this.state === 'playing' && !this._loadingMedia) this._advanceToNext();
+      }, remainMs);
+      this._prefetchAround(idx + 1);
       return;
     }
 
-    if (trType && this.mediaB && elapsed >= chunkDur - trDur) {
-      // In transition zone
-      const trProgress = Math.min((elapsed - (chunkDur - trDur)) / trDur, 1.0);
+    // ── Transition: keep old media for crossfade, remove after animation ──
+    const transition = chunk.transition || null;
+    const transDur = chunk.transition_duration || 500;
+    const oldMedia = this.container.querySelectorAll('video.cp-active, img.cp-active');
 
-      // Start next video if not started
-      if (this.mediaB.tagName === 'VIDEO' && this.mediaB.paused) {
-        this.mediaB.currentTime = 0;
-        this.mediaB.play().catch(() => {});
+    if (transition && oldMedia.length > 0 && seekMs === 0) {
+      oldMedia.forEach(el => {
+        el.style.zIndex = '4';
+        this._applyTransitionOut(el, transition, transDur);
+      });
+      setTimeout(() => {
+        oldMedia.forEach(el => {
+          if (el.tagName === 'VIDEO') { el.pause(); el.src = ''; el.load(); }
+          el.remove();
+        });
+      }, transDur + 50);
+    } else {
+      this._removeAllMedia();
+    }
+
+    // Hide placeholder/canvas
+    const placeholder = document.getElementById('editingPreviewPlaceholder');
+    if (placeholder) placeholder.style.display = 'none';
+    if (this.canvas) this.canvas.style.display = 'none';
+    const oldVid = document.getElementById('editingPreviewPlayer');
+    if (oldVid) oldVid.style.display = 'none';
+
+    const isCached = this._blobCache.has(idx);
+    const isImage = this._isImageOnly(chunk);
+
+    this._loadingMedia = true; // Flag: media is loading
+
+    if (isImage) {
+      const img = this._createImageEl(url);
+      if (transition && seekMs === 0) this._applyTransitionIn(img, transition, transDur);
+      this.container.appendChild(img);
+
+      const onImgReady = () => {
+        this._loadingMedia = false;
+        if (this.state !== 'playing') return;
+
+        // Compute actual seek from audio position (catch up to audio)
+        const audioMs = this._getAudioMs();
+        let actualSeek = seekMs;
+        if (audioMs != null) {
+          actualSeek = Math.max(seekMs, audioMs - chunkStartMs);
+        }
+        this._chunkSeekMs = actualSeek;
+        this._chunkStartedAt = performance.now();
+
+        // Fallback advance timeout (audio-driven timer is primary)
+        const remainMs = Math.max(100, (chunkDur - actualSeek) / this.playbackRate);
+        this._advanceTimeout = setTimeout(() => {
+          if (this.state === 'playing') this._advanceToNext();
+        }, remainMs);
+
+        this._prefetchAround(idx + 1);
+      };
+
+      if (img.complete) {
+        onImgReady();
+      } else {
+        img.onload = onImgReady;
+        img.onerror = () => {
+          console.error(`[Player] Chunk ${idx} image load error, skipping`);
+          this._loadingMedia = false;
+          if (isCached) {
+            URL.revokeObjectURL(this._blobCache.get(idx));
+            this._blobCache.delete(idx);
+          }
+          setTimeout(() => this._advanceToNext(), 100);
+        };
+      }
+    } else {
+      // Video chunk
+      const vid = this._createVideoEl(url);
+      if (transition && seekMs === 0) this._applyTransitionIn(vid, transition, transDur);
+      this.container.appendChild(vid);
+
+      const onReady = () => {
+        vid.oncanplay = null;
+        this._loadingMedia = false;
+        if (this.state !== 'playing') return;
+
+        // Compute actual seek from audio position (catch up to audio)
+        const audioMs = this._getAudioMs();
+        let actualSeek = seekMs;
+        if (audioMs != null) {
+          actualSeek = Math.max(seekMs, audioMs - chunkStartMs);
+        }
+        this._chunkSeekMs = actualSeek;
+
+        if (actualSeek > 0) vid.currentTime = actualSeek / 1000;
+        vid.playbackRate = this.playbackRate;
+        this._chunkStartedAt = performance.now();
+
+        vid.play().catch(() => {});
+
+        // Fallback advance timeout (audio-driven timer is primary)
+        const remainMs = Math.max(100, (chunkDur - actualSeek) / this.playbackRate);
+        this._advanceTimeout = setTimeout(() => {
+          if (this.state === 'playing') this._advanceToNext();
+        }, remainMs);
+
+        this._prefetchAround(idx + 1);
+      };
+
+      if (vid.readyState >= 3) {
+        onReady();
+      } else {
+        vid.oncanplay = onReady;
       }
 
-      this._drawTransition(ctx, w, h, trProgress, trType, this.mediaA, this.mediaB);
-    } else {
-      // Normal frame
-      this._drawMedia(ctx, this.mediaA, 0, 0, w, h);
-    }
+      vid.onended = null;
 
-    // Time update callback
-    if (this.onTimeUpdate) {
-      const globalMs = (this._offsets[this.currentIdx] || 0) + Math.min(elapsed, chunkDur);
-      this.onTimeUpdate(globalMs, this.totalDurMs);
+      vid.onerror = () => {
+        console.error(`[Player] Chunk ${idx} video load error, skipping`);
+        this._loadingMedia = false;
+        if (isCached) {
+          URL.revokeObjectURL(this._blobCache.get(idx));
+          this._blobCache.delete(idx);
+        }
+        setTimeout(() => this._advanceToNext(), 100);
+      };
     }
-
-    this.rafId = requestAnimationFrame(() => this._renderFrame());
   }
 
   _advanceToNext() {
-    const nextIdx = this.currentIdx + 1;
-    // Swap: B becomes A
-    this._destroyMedia(this.mediaA);
-    this.mediaA = this.mediaB;
-    this.mediaB = null;
-    this._startChunk(nextIdx, 0);
+    if (this._loadingMedia) return; // Don't advance while loading
+    this._clearAdvanceTimeout();
+    // Don't stop UI timer — it runs continuously
+    this._startChunk(this.currentIdx + 1, 0);
   }
 
-  _drawMedia(ctx, media, x, y, w, h) {
-    if (!media) { ctx.fillStyle = '#000'; ctx.fillRect(x, y, w, h); return; }
-    try { ctx.drawImage(media, x, y, w, h); } catch (e) {
-      ctx.fillStyle = '#000'; ctx.fillRect(x, y, w, h);
-    }
+  // Audio-driven UI timer: runs CONTINUOUSLY during playback.
+  // Uses audio.currentTime as master clock for progress display AND chunk advancement.
+  _startUITimer() {
+    this._stopUITimer();
+    this._timerInterval = setInterval(() => {
+      if (this.state !== 'playing') return;
+
+      // Use audio as master clock when available
+      const audioMs = this._getAudioMs();
+      let globalMs;
+      if (audioMs != null) {
+        globalMs = audioMs;
+      } else {
+        // Fallback: offset + elapsed (for when audio hasn't loaded yet)
+        const elapsed = (performance.now() - (this._chunkStartedAt || performance.now())) * this.playbackRate;
+        globalMs = (this._offsets[this.currentIdx] || 0) + (this._chunkSeekMs || 0) + elapsed;
+      }
+
+      // ALWAYS update time display — even during media loading
+      if (this.onTimeUpdate) this.onTimeUpdate(Math.min(globalMs, this.totalDurMs), this.totalDurMs);
+
+      // Audio-driven chunk advancement (only when not loading media)
+      if (!this._loadingMedia && audioMs != null && this.currentIdx < this.chunks.length - 1) {
+        let targetIdx = this.currentIdx;
+        for (let i = this.chunks.length - 1; i > this.currentIdx; i--) {
+          const chunkStart = this.chunks[i].start_ms ?? this._offsets[i] ?? Infinity;
+          if (audioMs >= chunkStart) {
+            targetIdx = i;
+            break;
+          }
+        }
+        if (targetIdx > this.currentIdx) {
+          // Audio has advanced past current chunk — advance visuals to match
+          this._clearAdvanceTimeout();
+          this._startChunk(targetIdx, 0);
+          return;
+        }
+      }
+
+      // Check for end of playback
+      if (globalMs >= this.totalDurMs - 200) {
+        this._stopUITimer();
+        this._clearAdvanceTimeout();
+        this._removeAllMedia();
+        if (this.audio) this.audio.pause();
+        this.state = 'idle';
+        this._loadingMedia = false;
+        this._fireStateChange();
+        if (this.onEnd) this.onEnd();
+      }
+    }, 100);
   }
 
-  // ── Transition rendering ──────────────────────────────────────────────
-
-  _drawTransition(ctx, w, h, progress, type, mediaA, mediaB) {
-    const p = Math.max(0, Math.min(1, progress));
-    switch (type) {
-      case 'fade': case 'dissolve': this._trFade(ctx, w, h, p, mediaA, mediaB); break;
-      case 'fadeblack': this._trFadeColor(ctx, w, h, p, mediaA, mediaB, '#000'); break;
-      case 'fadewhite': this._trFadeColor(ctx, w, h, p, mediaA, mediaB, '#fff'); break;
-      case 'wipeleft':  this._trWipe(ctx, w, h, p, mediaA, mediaB, 'left'); break;
-      case 'wiperight': this._trWipe(ctx, w, h, p, mediaA, mediaB, 'right'); break;
-      case 'wipeup':    this._trWipe(ctx, w, h, p, mediaA, mediaB, 'up'); break;
-      case 'wipedown':  this._trWipe(ctx, w, h, p, mediaA, mediaB, 'down'); break;
-      case 'slideleft':  this._trSlide(ctx, w, h, p, mediaA, mediaB, 'left'); break;
-      case 'slideright': this._trSlide(ctx, w, h, p, mediaA, mediaB, 'right'); break;
-      case 'slideup':    this._trSlide(ctx, w, h, p, mediaA, mediaB, 'up'); break;
-      case 'slidedown':  this._trSlide(ctx, w, h, p, mediaA, mediaB, 'down'); break;
-      case 'circleopen':  this._trCircle(ctx, w, h, p, mediaA, mediaB, true); break;
-      case 'circleclose': this._trCircle(ctx, w, h, p, mediaA, mediaB, false); break;
-      case 'radial':      this._trRadial(ctx, w, h, p, mediaA, mediaB); break;
-      case 'smoothleft':  this._trSmooth(ctx, w, h, p, mediaA, mediaB, 'left'); break;
-      case 'smoothright': this._trSmooth(ctx, w, h, p, mediaA, mediaB, 'right'); break;
-      case 'zoomin':      this._trZoom(ctx, w, h, p, mediaA, mediaB); break;
-      default: this._trFade(ctx, w, h, p, mediaA, mediaB);
-    }
+  _stopUITimer() {
+    if (this._timerInterval) { clearInterval(this._timerInterval); this._timerInterval = null; }
+    // NOTE: Does NOT touch _advanceTimeout anymore!
   }
 
-  // ── Transition implementations ────────────────────────────────────────
-
-  _trFade(ctx, w, h, p, a, b) {
-    ctx.globalAlpha = 1;
-    this._drawMedia(ctx, a, 0, 0, w, h);
-    ctx.globalAlpha = p;
-    this._drawMedia(ctx, b, 0, 0, w, h);
-    ctx.globalAlpha = 1;
-  }
-
-  _trFadeColor(ctx, w, h, p, a, b, color) {
-    if (p < 0.5) {
-      const sub = p * 2;
-      ctx.globalAlpha = 1;
-      this._drawMedia(ctx, a, 0, 0, w, h);
-      ctx.globalAlpha = sub;
-      ctx.fillStyle = color;
-      ctx.fillRect(0, 0, w, h);
-      ctx.globalAlpha = 1;
-    } else {
-      const sub = (p - 0.5) * 2;
-      ctx.fillStyle = color;
-      ctx.fillRect(0, 0, w, h);
-      ctx.globalAlpha = sub;
-      this._drawMedia(ctx, b, 0, 0, w, h);
-      ctx.globalAlpha = 1;
-    }
-  }
-
-  _trWipe(ctx, w, h, p, a, b, dir) {
-    ctx.globalAlpha = 1;
-    this._drawMedia(ctx, a, 0, 0, w, h);
-    ctx.save();
-    ctx.beginPath();
-    switch (dir) {
-      case 'left':  ctx.rect(w * (1 - p), 0, w * p, h); break;
-      case 'right': ctx.rect(0, 0, w * p, h); break;
-      case 'up':    ctx.rect(0, h * (1 - p), w, h * p); break;
-      case 'down':  ctx.rect(0, 0, w, h * p); break;
-    }
-    ctx.clip();
-    this._drawMedia(ctx, b, 0, 0, w, h);
-    ctx.restore();
-  }
-
-  _trSlide(ctx, w, h, p, a, b, dir) {
-    ctx.globalAlpha = 1;
-    let ax = 0, ay = 0, bx = 0, by = 0;
-    switch (dir) {
-      case 'left':  ax = -w * p; bx = w * (1 - p); break;
-      case 'right': ax = w * p;  bx = -w * (1 - p); break;
-      case 'up':    ay = -h * p; by = h * (1 - p); break;
-      case 'down':  ay = h * p;  by = -h * (1 - p); break;
-    }
-    this._drawMedia(ctx, a, ax, ay, w, h);
-    this._drawMedia(ctx, b, bx, by, w, h);
-  }
-
-  _trCircle(ctx, w, h, p, a, b, opening) {
-    const maxR = Math.sqrt(w * w + h * h) / 2;
-    const r = opening ? (p * maxR) : (maxR * (1 - p));
-    ctx.globalAlpha = 1;
-    if (opening) {
-      this._drawMedia(ctx, a, 0, 0, w, h);
-      ctx.save();
-      ctx.beginPath();
-      ctx.arc(w / 2, h / 2, Math.max(r, 1), 0, Math.PI * 2);
-      ctx.clip();
-      this._drawMedia(ctx, b, 0, 0, w, h);
-      ctx.restore();
-    } else {
-      this._drawMedia(ctx, b, 0, 0, w, h);
-      ctx.save();
-      ctx.beginPath();
-      ctx.arc(w / 2, h / 2, Math.max(r, 1), 0, Math.PI * 2);
-      ctx.clip();
-      this._drawMedia(ctx, a, 0, 0, w, h);
-      ctx.restore();
-    }
-  }
-
-  _trRadial(ctx, w, h, p, a, b) {
-    const cx = w / 2, cy = h / 2;
-    const maxR = Math.sqrt(w * w + h * h);
-    const angle = p * Math.PI * 2 - Math.PI / 2;
-    ctx.globalAlpha = 1;
-    this._drawMedia(ctx, a, 0, 0, w, h);
-    ctx.save();
-    ctx.beginPath();
-    ctx.moveTo(cx, cy);
-    ctx.arc(cx, cy, maxR, -Math.PI / 2, angle, false);
-    ctx.closePath();
-    ctx.clip();
-    this._drawMedia(ctx, b, 0, 0, w, h);
-    ctx.restore();
-  }
-
-  _trSmooth(ctx, w, h, p, a, b, dir) {
-    ctx.globalAlpha = 1;
-    this._drawMedia(ctx, a, 0, 0, w, h);
-    const tmp = document.createElement('canvas');
-    tmp.width = w; tmp.height = h;
-    const tc = tmp.getContext('2d');
-    this._drawMedia(tc, b, 0, 0, w, h);
-    tc.globalCompositeOperation = 'destination-in';
-    const feather = w * 0.15;
-    let grad;
-    if (dir === 'left') {
-      const edge = w * (1 - p);
-      grad = tc.createLinearGradient(edge + feather, 0, edge - feather, 0);
-    } else {
-      const edge = w * p;
-      grad = tc.createLinearGradient(edge - feather, 0, edge + feather, 0);
-    }
-    grad.addColorStop(0, 'rgba(0,0,0,0)');
-    grad.addColorStop(1, 'rgba(0,0,0,1)');
-    tc.fillStyle = grad;
-    tc.fillRect(0, 0, w, h);
-    ctx.drawImage(tmp, 0, 0);
-  }
-
-  _trZoom(ctx, w, h, p, a, b) {
-    ctx.globalAlpha = 1;
-    this._drawMedia(ctx, a, 0, 0, w, h);
-    const scale = p;
-    const sw = w * scale, sh = h * scale;
-    const sx = (w - sw) / 2, sy = (h - sh) / 2;
-    ctx.globalAlpha = p;
-    this._drawMedia(ctx, b, sx, sy, sw, sh);
-    ctx.globalAlpha = 1;
+  _clearAdvanceTimeout() {
+    if (this._advanceTimeout) { clearTimeout(this._advanceTimeout); this._advanceTimeout = null; }
   }
 
   _fireStateChange() {
     if (this.onStateChange) this.onStateChange(this.state);
+  }
+
+  // ── Transition animations ────────────────────────────────────────────
+
+  _applyTransitionIn(el, transition, durationMs) {
+    const dur = durationMs + 'ms';
+    el.style.zIndex = '5';
+    switch (transition) {
+      case 'fade': case 'dissolve':
+        el.style.opacity = '0';
+        el.style.transition = `opacity ${dur} ease`;
+        requestAnimationFrame(() => requestAnimationFrame(() => { el.style.opacity = '1'; }));
+        break;
+      case 'fadeblack':
+        el.style.opacity = '0';
+        el.style.transition = `opacity ${dur} ease`;
+        requestAnimationFrame(() => requestAnimationFrame(() => { el.style.opacity = '1'; }));
+        break;
+      case 'fadewhite':
+        el.style.opacity = '0';
+        el.style.transition = `opacity ${dur} ease`;
+        requestAnimationFrame(() => requestAnimationFrame(() => { el.style.opacity = '1'; }));
+        break;
+      case 'slideleft': case 'smoothleft':
+        el.style.transform = 'translateX(100%)';
+        el.style.transition = `transform ${dur} ease`;
+        requestAnimationFrame(() => requestAnimationFrame(() => { el.style.transform = 'translateX(0)'; }));
+        break;
+      case 'slideright': case 'smoothright':
+        el.style.transform = 'translateX(-100%)';
+        el.style.transition = `transform ${dur} ease`;
+        requestAnimationFrame(() => requestAnimationFrame(() => { el.style.transform = 'translateX(0)'; }));
+        break;
+      case 'slideup': case 'smoothup':
+        el.style.transform = 'translateY(100%)';
+        el.style.transition = `transform ${dur} ease`;
+        requestAnimationFrame(() => requestAnimationFrame(() => { el.style.transform = 'translateY(0)'; }));
+        break;
+      case 'slidedown': case 'smoothdown':
+        el.style.transform = 'translateY(-100%)';
+        el.style.transition = `transform ${dur} ease`;
+        requestAnimationFrame(() => requestAnimationFrame(() => { el.style.transform = 'translateY(0)'; }));
+        break;
+      case 'zoomin':
+        el.style.transform = 'scale(0.3)';
+        el.style.opacity = '0';
+        el.style.transition = `transform ${dur} ease, opacity ${dur} ease`;
+        requestAnimationFrame(() => requestAnimationFrame(() => {
+          el.style.transform = 'scale(1)';
+          el.style.opacity = '1';
+        }));
+        break;
+      case 'wipeleft':
+        el.style.clipPath = 'inset(0 100% 0 0)';
+        el.style.transition = `clip-path ${dur} ease`;
+        requestAnimationFrame(() => requestAnimationFrame(() => { el.style.clipPath = 'inset(0 0 0 0)'; }));
+        break;
+      case 'wiperight':
+        el.style.clipPath = 'inset(0 0 0 100%)';
+        el.style.transition = `clip-path ${dur} ease`;
+        requestAnimationFrame(() => requestAnimationFrame(() => { el.style.clipPath = 'inset(0 0 0 0)'; }));
+        break;
+      case 'wipeup':
+        el.style.clipPath = 'inset(100% 0 0 0)';
+        el.style.transition = `clip-path ${dur} ease`;
+        requestAnimationFrame(() => requestAnimationFrame(() => { el.style.clipPath = 'inset(0 0 0 0)'; }));
+        break;
+      case 'wipedown':
+        el.style.clipPath = 'inset(0 0 100% 0)';
+        el.style.transition = `clip-path ${dur} ease`;
+        requestAnimationFrame(() => requestAnimationFrame(() => { el.style.clipPath = 'inset(0 0 0 0)'; }));
+        break;
+      case 'circleopen':
+        el.style.clipPath = 'circle(0% at 50% 50%)';
+        el.style.transition = `clip-path ${dur} ease`;
+        requestAnimationFrame(() => requestAnimationFrame(() => { el.style.clipPath = 'circle(75% at 50% 50%)'; }));
+        break;
+      case 'circleclose':
+        el.style.clipPath = 'circle(75% at 50% 50%)';
+        el.style.transition = `clip-path ${dur} ease`;
+        requestAnimationFrame(() => requestAnimationFrame(() => { el.style.clipPath = 'circle(0% at 50% 50%)'; }));
+        break;
+      case 'radial':
+        el.style.clipPath = 'circle(0% at 50% 50%)';
+        el.style.transition = `clip-path ${dur} ease-out`;
+        requestAnimationFrame(() => requestAnimationFrame(() => { el.style.clipPath = 'circle(75% at 50% 50%)'; }));
+        break;
+      default:
+        // No recognized transition — just show immediately
+        el.style.opacity = '1';
+        break;
+    }
+  }
+
+  _applyTransitionOut(el, transition, durationMs) {
+    const dur = durationMs + 'ms';
+    switch (transition) {
+      case 'fade': case 'dissolve':
+        el.style.transition = `opacity ${dur} ease`;
+        el.style.opacity = '0';
+        break;
+      case 'fadeblack': case 'fadewhite':
+        el.style.transition = `opacity ${dur} ease`;
+        el.style.opacity = '0';
+        break;
+      case 'slideleft': case 'smoothleft':
+        el.style.transition = `transform ${dur} ease`;
+        el.style.transform = 'translateX(-100%)';
+        break;
+      case 'slideright': case 'smoothright':
+        el.style.transition = `transform ${dur} ease`;
+        el.style.transform = 'translateX(100%)';
+        break;
+      case 'slideup': case 'smoothup':
+        el.style.transition = `transform ${dur} ease`;
+        el.style.transform = 'translateY(-100%)';
+        break;
+      case 'slidedown': case 'smoothdown':
+        el.style.transition = `transform ${dur} ease`;
+        el.style.transform = 'translateY(100%)';
+        break;
+      case 'zoomin':
+        el.style.transition = `transform ${dur} ease, opacity ${dur} ease`;
+        el.style.transform = 'scale(1.5)';
+        el.style.opacity = '0';
+        break;
+      case 'wipeleft':
+        el.style.transition = `clip-path ${dur} ease`;
+        el.style.clipPath = 'inset(0 0 0 100%)';
+        break;
+      case 'wiperight':
+        el.style.transition = `clip-path ${dur} ease`;
+        el.style.clipPath = 'inset(0 100% 0 0)';
+        break;
+      case 'wipeup':
+        el.style.transition = `clip-path ${dur} ease`;
+        el.style.clipPath = 'inset(0 0 100% 0)';
+        break;
+      case 'wipedown':
+        el.style.transition = `clip-path ${dur} ease`;
+        el.style.clipPath = 'inset(100% 0 0 0)';
+        break;
+      case 'circleopen': case 'circleclose': case 'radial':
+        el.style.transition = `clip-path ${dur} ease`;
+        el.style.clipPath = 'circle(0% at 50% 50%)';
+        break;
+      default:
+        el.style.transition = `opacity ${dur} ease`;
+        el.style.opacity = '0';
+        break;
+    }
   }
 }

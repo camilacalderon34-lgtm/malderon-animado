@@ -125,6 +125,34 @@ def _render_web_image_animation(image_path_str: str, chunk, project, project_dir
         return None
 
 
+def _render_fullscreen_image(image_path_str: str, chunk, project_dir: Path) -> str | None:
+    """Render fullscreen video for a web_image_full scene (no frame, just zoom)."""
+    try:
+        from .remotion_service import render_fullscreen_scene
+        img_p = Path(image_path_str)
+        if not img_p.exists():
+            return None
+        vid_out = project_dir / "videos" / f"fullscene_{chunk.chunk_number}.mp4"
+        vid_out.parent.mkdir(parents=True, exist_ok=True)
+        dur = ((chunk.end_ms or 0) - (chunk.start_ms or 0)) / 1000.0
+        if dur <= 0:
+            dur = 5.0
+        zoom_in = (chunk.chunk_number % 2 == 0)
+        ok = render_fullscreen_scene(
+            image_path=img_p,
+            output_path=vid_out,
+            duration_seconds=dur,
+            zoom_in=zoom_in,
+        )
+        if ok:
+            _safe_print(f"[FullscreenScene] OK: {vid_out.name} ({'zoom-in' if zoom_in else 'zoom-out'})")
+            return str(vid_out)
+        return None
+    except Exception as exc:
+        _safe_print(f"[FullscreenScene] Error: {exc}")
+        return None
+
+
 def _log(db: Session, project_id: int, message: str, stage: str = "", level: str = "info"):
     from ..models import Log
     import sys as _sys
@@ -168,6 +196,18 @@ def _update_project(db: Session, project: Project, **kwargs):
     except Exception:
         db.rollback()
         raise
+
+
+def _set_project_status(db: Session, project_id: int, status, error_message: str | None = None):
+    """Thread-safe project status update — always re-queries to avoid DetachedInstanceError."""
+    proj = db.query(Project).filter(Project.id == project_id).first()
+    if not proj:
+        return
+    proj.status = status
+    if error_message is not None:
+        proj.error_message = error_message
+    proj.updated_at = datetime.utcnow()
+    db.commit()
 
 
 def _update_chunk(db: Session, chunk: Chunk, **kwargs):
@@ -793,6 +833,30 @@ def _run_create_scenes_from_srt(project_id: int) -> None:
              f"SRT encontrado: {Path(srt_file).name} ({len(srt_entries)} entradas, {total_duration:.1f}s).",
              stage="srt_scenes")
 
+        # ── [Whisper] Generate accurate SRT from actual audio if possible
+        vo = voiceover_dir(slug)
+        audio_complete = vo / "audio-completo.mp3"
+        whisper_srt_path = vo / "subtitles-whisper.srt"
+        if audio_complete.exists() and not whisper_srt_path.exists():
+            try:
+                _log(db, project_id,
+                     "Running Whisper for accurate SRT timestamps...",
+                     stage="srt_scenes")
+                from .openai_service import transcribe_to_srt as _whisper_srt
+                whisper_srt = _whisper_srt(audio_complete)
+                whisper_srt_path.write_text(whisper_srt, encoding="utf-8")
+                srt_content = whisper_srt  # Use Whisper SRT instead of TTS SRT
+                _log(db, project_id,
+                     f"Whisper SRT generated ({len(whisper_srt)} chars). Using accurate timestamps.",
+                     stage="srt_scenes")
+            except Exception as whisper_exc:
+                _log(db, project_id,
+                     f"Whisper failed ({whisper_exc}), using TTS SRT as fallback.",
+                     stage="srt_scenes", level="warning")
+        elif whisper_srt_path.exists():
+            srt_content = whisper_srt_path.read_text(encoding="utf-8", errors="replace")
+            _log(db, project_id, "Using existing Whisper SRT.", stage="srt_scenes")
+
         # ── Call Claude Sonnet (Anthropic direct) to divide script into scenes
         project_mode = project.mode.value if project.mode else "animated"
         print(f"[SceneDivision] USANDO divide_script_into_scenes con Sonnet (Anthropic) — modo={project_mode}, proyecto='{project.title}'")
@@ -891,9 +955,15 @@ def start_create_scenes_from_srt(project_id: int) -> None:
 
 # ── Scene planning (visual analysis only) ────────────────────────────────────
 
-def _run_plan_scenes(project_id: int, allowed_types: list | None = None) -> None:
+def _run_plan_scenes(project_id: int, allowed_types: list | None = None,
+                     type_weights: dict | None = None) -> None:
     """Run visual analysis on all scenes and store asset_type + search_keywords.
-    Does NOT search or download assets — only classifies."""
+    Does NOT search or download assets — only classifies.
+
+    Args:
+        allowed_types: list of asset_type strings that Claude can use
+        type_weights: dict mapping asset_type -> target percentage (e.g. {"stock_video": 70, "web_image": 20})
+    """
     db = SessionLocal()
     try:
         project = db.query(Project).filter(Project.id == project_id).first()
@@ -901,7 +971,11 @@ def _run_plan_scenes(project_id: int, allowed_types: list | None = None) -> None
             return
 
         types_label = ", ".join(allowed_types) if allowed_types else "todos"
-        _log(db, project_id, f"🧠 Planificando escenas (tipos: {types_label})…", stage="plan_scenes")
+        weights_label = ", ".join(f"{k}={v}%" for k, v in (type_weights or {}).items())
+        _log(db, project_id,
+             f"🧠 Planificando escenas (tipos: {types_label}"
+             f"{', pesos: ' + weights_label if weights_label else ''})…",
+             stage="plan_scenes")
 
         chunks = (
             db.query(Chunk)
@@ -920,9 +994,17 @@ def _run_plan_scenes(project_id: int, allowed_types: list | None = None) -> None
         full_script = project.script_final or project.script or ""
         collection = project.collection or "general"
 
+        total_scenes = len(scenes_for_analysis)
+        batch_size = 20
+        total_batches = (total_scenes + batch_size - 1) // batch_size
+        _log(db, project_id,
+             f"🔀 Enviando {total_scenes} escenas en {total_batches} bloques paralelos a OpenRouter…",
+             stage="plan_scenes")
+
         analyses = visual_analyzer_service.analyze_scenes(
             full_script, scenes_for_analysis, collection,
             allowed_types=allowed_types,
+            type_weights=type_weights,
             project_title=project.title or "",
         )
         analysis_map = {a["scene_id"]: a for a in analyses}
@@ -955,13 +1037,502 @@ def _run_plan_scenes(project_id: int, allowed_types: list | None = None) -> None
         db.close()
 
 
-def start_plan_scenes(project_id: int, allowed_types: list | None = None) -> None:
+def start_plan_scenes(project_id: int, allowed_types: list | None = None,
+                      type_weights: dict | None = None) -> None:
     """Launch scene planning in background thread."""
-    t = threading.Thread(target=_run_plan_scenes, args=(project_id, allowed_types), daemon=True)
+    t = threading.Thread(target=_run_plan_scenes, args=(project_id, allowed_types, type_weights), daemon=True)
     t.start()
 
 
+class _SimpleProject:
+    """Lightweight stand-in for Project when only .collection is needed (thread-safe)."""
+    def __init__(self, collection: str):
+        self.collection = collection
+
+
 # ── Stock footage asset search ────────────────────────────────────────────────
+
+
+def _process_one_scene(
+    project_id: int,
+    chunk_id: int,
+    analysis: dict,
+    project_dir: Path,
+    collection: str,
+    used_videos_lock: threading.Lock,
+    used_videos: set,
+    found_counter: list,
+    total: int,
+    idx: int,
+    poll_key: str,
+    project_title: str,
+    script_context: str = "",
+) -> None:
+    """Process a single scene's asset search in its own thread with its own DB session."""
+    import json as _json
+    db = SessionLocal()
+    try:
+        chunk = db.query(Chunk).filter(Chunk.id == chunk_id).first()
+        if not chunk:
+            return
+
+        # If analysis is None (verification pass), rebuild from chunk data
+        if analysis is None:
+            analysis = {
+                "asset_type": chunk.asset_type or "clip_bank",
+                "search_query": chunk.search_keywords.split("|")[0] if chunk.search_keywords else (chunk.scene_text or "")[:80],
+                "search_query_alt": chunk.search_keywords.split("|")[1] if chunk.search_keywords and "|" in chunk.search_keywords else "",
+                "overlay_text": chunk.overlay_text or "",
+            }
+
+        _log(db, project_id,
+             f"🔎 [{idx}/{total}] Escena {chunk.chunk_number}: "
+             f"tipo={analysis.get('asset_type')}, query='{analysis.get('search_query')}'",
+             stage="stock_search")
+
+        # Calculate scene duration from SRT timings
+        scene_duration = None
+        if chunk.start_ms is not None and chunk.end_ms is not None:
+            scene_duration = (chunk.end_ms - chunk.start_ms) / 1000.0
+
+        # ── Title card: render with Remotion instead of searching ──
+        scene_asset_type_pre = chunk.asset_type or analysis.get("asset_type", "")
+        if scene_asset_type_pre == "title_card":
+            raw_text = (chunk.overlay_text
+                        or analysis.get("overlay_text", "")
+                        or (chunk.scene_text or "")[:120].strip())
+            overlay = _generate_short_title(
+                scene_text=chunk.scene_text or "",
+                overlay_text=raw_text,
+                project_title=project_title,
+            ) if raw_text else ""
+            if overlay:
+                from .remotion_service import render_title_card
+
+                bg_image_path = None
+                _log(db, project_id,
+                     f"🖼️ [{idx}/{total}] Escena {chunk.chunk_number}: buscando imagen de fondo para título…",
+                     stage="stock_search")
+                try:
+                    bg_analysis = dict(analysis)
+                    bg_analysis["asset_type"] = "web_image"
+                    # For title backgrounds, prefer the alt query (more visual/generic)
+                    # and use the specific query as fallback
+                    orig_query = bg_analysis.get("search_query", "")
+                    orig_alt = bg_analysis.get("search_query_alt", "")
+                    if orig_alt:
+                        bg_analysis["search_query"] = orig_alt
+                        bg_analysis["search_query_alt"] = orig_query
+                    bg_result = stock_search_service.find_asset_for_scene(
+                        scene_id=chunk.chunk_number,
+                        analysis=bg_analysis,
+                        project_dir=project_dir,
+                        collection=collection,
+                        used_videos=used_videos,
+                        min_duration=None,
+                        scene_text=chunk.scene_text or "",
+                        project_title=project_title,
+                    )
+                    bg_local = bg_result.get("local_path")
+                    if bg_local and not bg_local.endswith(".mp4"):
+                        bg_image_path = Path(bg_local)
+                        _log(db, project_id,
+                             f"✅ [{idx}/{total}] Escena {chunk.chunk_number}: fondo encontrado → {Path(bg_local).name}",
+                             stage="stock_search")
+                except Exception as bg_exc:
+                    _safe_print(f"[TitleCard] Background search failed: {bg_exc}")
+
+                tc_path = project_dir / "assets" / f"title_{chunk.chunk_number}.mp4"
+                tc_path.parent.mkdir(parents=True, exist_ok=True)
+                tc_duration = scene_duration if scene_duration and scene_duration > 0 else 5.0
+                bg_label = " + fondo" if bg_image_path else ""
+                _log(db, project_id,
+                     f"📝 [{idx}/{total}] Escena {chunk.chunk_number}: renderizando título animado{bg_label} '{overlay[:50]}'…",
+                     stage="stock_search")
+                tc_success = render_title_card(
+                    overlay, tc_path,
+                    duration_seconds=tc_duration,
+                    background_image=bg_image_path,
+                )
+                tc_kwargs = {"asset_type": "title_card", "overlay_text": overlay}
+                if bg_image_path:
+                    tc_kwargs["image_path"] = str(bg_image_path)
+                if tc_success:
+                    tc_kwargs["video_path"] = str(tc_path)
+                    tc_kwargs["asset_source"] = "remotion_title"
+                    tc_kwargs["status"] = ChunkStatus.done
+                    found_counter[0] += 1
+                    _log(db, project_id,
+                         f"✅ [{idx}/{total}] Escena {chunk.chunk_number}: título animado{bg_label} OK",
+                         stage="stock_search")
+                else:
+                    tc_kwargs["status"] = ChunkStatus.error
+                    tc_kwargs["error_message"] = "Title card render failed"
+                    _log(db, project_id,
+                         f"❌ [{idx}/{total}] Escena {chunk.chunk_number}: error en título",
+                         stage="stock_search", level="warning")
+                _update_chunk(db, chunk, **tc_kwargs)
+                return
+            _update_chunk(db, chunk, status=ChunkStatus.error,
+                          error_message="Title card sin texto")
+            return
+
+        # Search with retry: if result is a duplicate (race condition), retry once
+        result = None
+        for _attempt in range(2):
+            result = stock_search_service.find_asset_for_scene(
+                scene_id=chunk.chunk_number,
+                analysis=analysis,
+                project_dir=project_dir,
+                collection=collection,
+                used_videos=used_videos,
+                min_duration=scene_duration,
+                scene_text=chunk.scene_text or "",
+                project_title=project_title,
+                script_context=script_context,
+            )
+            # Thread-safe: register ALL identifiers in shared set immediately
+            with used_videos_lock:
+                origin = result.get("origin_url", "")
+                yt_id = result.get("youtube_id", "")
+                local = result.get("local_path", "")
+                # Check for race-condition duplicate (another thread got same clip)
+                is_dup = False
+                if origin and origin in used_videos:
+                    is_dup = True
+                if yt_id and yt_id in used_videos:
+                    is_dup = True
+                if is_dup:
+                    _safe_print(f"[StockSearch] Scene {chunk.chunk_number}: DUPLICATE detected (race), retrying…")
+                    # Delete the duplicate file
+                    if local and Path(local).exists():
+                        Path(local).unlink(missing_ok=True)
+                    continue
+                # Not a duplicate — register all identifiers
+                if origin:
+                    used_videos.add(origin)
+                if yt_id:
+                    used_videos.add(yt_id)
+                if local:
+                    used_videos.add(Path(local).stem)
+                # Persist youtube_id in DB for future runs
+                if yt_id:
+                    try:
+                        existing = set()
+                        if chunk.rejected_sources:
+                            existing = set(_json.loads(chunk.rejected_sources))
+                        existing.add(yt_id)
+                        _update_chunk(db, chunk, rejected_sources=_json.dumps(list(existing)))
+                    except Exception:
+                        pass
+                if origin:
+                    try:
+                        existing = set()
+                        if chunk.rejected_sources:
+                            existing = set(_json.loads(chunk.rejected_sources))
+                        existing.add(origin)
+                        _update_chunk(db, chunk, rejected_sources=_json.dumps(list(existing)))
+                    except Exception:
+                        pass
+            break  # success, no duplicate
+
+        # Update chunk in DB — preserve planned asset_type
+        update_kwargs = {
+            "asset_source": result.get("asset_source"),
+        }
+        if not chunk.asset_type:
+            update_kwargs["asset_type"] = result.get("asset_type_found")
+        if result.get("overlay_text"):
+            update_kwargs["overlay_text"] = result["overlay_text"]
+
+        local_path = result.get("local_path")
+        scene_type = chunk.asset_type or analysis.get("asset_type", "")
+        _CLIP_BANK_VALID_SOURCES = {"clip_bank", "youtube", "yt-dlp"}
+
+        # clip_bank: ONLY accept real video from YouTube/clip_bank, reject everything else
+        if local_path and scene_type == "clip_bank":
+            src = result.get("asset_source", "")
+            if src not in _CLIP_BANK_VALID_SOURCES:
+                _safe_print(f"[StockSearch] Scene {chunk.chunk_number}: clip_bank rejecting source '{src}' (not real video)")
+                Path(local_path).unlink(missing_ok=True)
+                local_path = None
+
+        if local_path:
+            if local_path.endswith(".mp4"):
+                try:
+                    from .youtube_clip_service import _clean_clip
+                    _clean_clip(Path(local_path))
+                except Exception as exc:
+                    _safe_print(f"[StockSearch] Clean clip error (non-fatal): {exc}")
+                if Path(local_path).exists() and Path(local_path).stat().st_size > 5000:
+                    update_kwargs["video_path"] = local_path
+                else:
+                    _safe_print(f"[StockSearch] Scene {chunk.chunk_number}: video file missing after clean! {local_path}")
+                    local_path = None
+            else:
+                # Non-mp4 for clip_bank already rejected above
+                update_kwargs["image_path"] = local_path
+                if scene_type == "web_image":
+                    vid_path = _render_web_image_animation(local_path, chunk, _SimpleProject(collection), project_dir)
+                    if vid_path:
+                        update_kwargs["video_path"] = vid_path
+                elif scene_type == "web_image_full":
+                    vid_path = _render_fullscreen_image(local_path, chunk, project_dir)
+                    if vid_path:
+                        update_kwargs["video_path"] = vid_path
+                elif scene_type in ("stock_video", "archive_footage", "space_media"):
+                    # stock_video got image fallback (no video API keys) — animate it
+                    vid_path = _render_web_image_animation(local_path, chunk, _SimpleProject(collection), project_dir)
+                    if vid_path:
+                        update_kwargs["video_path"] = vid_path
+            if local_path:
+                found_counter[0] += 1
+
+        # If no asset found, generate AI image IMMEDIATELY (never for clip_bank)
+        cur_asset_type = chunk.asset_type or analysis.get("asset_type", "")
+        if not local_path and result.get("asset_type_found") == "ai_image" and cur_asset_type not in ("web_image", "clip_bank"):
+            try:
+                # Generate a proper cinematic prompt instead of using raw search_query
+                scene_narration = chunk.scene_text or ""
+                search_hint = analysis.get("search_query", "abstract background")
+                try:
+                    prompt = generate_image_prompt(
+                        narration=scene_narration,
+                        visual_description=f"{search_hint}. Video title: {project_title}",
+                    )
+                    _safe_print(f"[AIImage] Scene {chunk.chunk_number}: generated prompt: {prompt[:100]}")
+                except Exception:
+                    prompt = f"Cinematic photorealistic image of {search_hint}, dramatic lighting, 4K"
+                img_path = project_dir / "assets" / f"scene_{chunk.chunk_number}.jpg"
+                img_path.parent.mkdir(parents=True, exist_ok=True)
+                _log(db, project_id,
+                     f"🎨 Escena {chunk.chunk_number}: generando AI image… prompt='{prompt[:60]}'",
+                     stage="stock_search")
+                _dispatch_generate_image(prompt, img_path, provider="pollinations", api_key=poll_key)
+                if img_path.exists() and img_path.stat().st_size > 1000:
+                    update_kwargs["image_path"] = str(img_path)
+                    update_kwargs["asset_source"] = "pollinations"
+                    local_path = str(img_path)
+                    _log(db, project_id,
+                         f"✅ Escena {chunk.chunk_number}: AI image OK ({img_path.stat().st_size} bytes)",
+                         stage="stock_search")
+                else:
+                    sz = img_path.stat().st_size if img_path.exists() else 0
+                    _log(db, project_id,
+                         f"⚠️ Escena {chunk.chunk_number}: AI image vacía o muy pequeña ({sz} bytes)",
+                         stage="stock_search", level="warning")
+            except Exception as exc:
+                _log(db, project_id,
+                     f"❌ Escena {chunk.chunk_number}: AI image error: {exc}",
+                     stage="stock_search", level="warning")
+
+        # For image-based types: render animation/zoom from the image
+        scene_asset_type = chunk.asset_type or analysis.get("asset_type", "")
+        if (scene_asset_type in ("web_image", "web_image_full", "ai_image")
+                and local_path and not local_path.endswith(".mp4")
+                and "video_path" not in update_kwargs):
+            if scene_asset_type in ("web_image_full", "ai_image"):
+                vid_path = _render_fullscreen_image(local_path, chunk, project_dir)
+            else:
+                vid_path = _render_web_image_animation(local_path, chunk, _SimpleProject(collection), project_dir)
+            if vid_path:
+                update_kwargs["video_path"] = vid_path
+
+        # Update chunk status based on search result
+        if local_path:
+            update_kwargs["status"] = ChunkStatus.done
+        elif scene_asset_type == "ai_image" and not local_path:
+            update_kwargs["status"] = ChunkStatus.error
+            update_kwargs["error_message"] = "AI image generation failed"
+        elif scene_asset_type in ("web_image", "web_image_full") and not local_path:
+            _safe_print(f"[StockSearch] Scene {chunk.chunk_number}: web_image initial search failed, retrying...")
+            web_retry_success = False
+            broader_kw = (chunk.search_keywords or "").split("|")
+            scene_words = (chunk.scene_text or "")[:100].strip()
+            retry_queries = [
+                (scene_words, broader_kw[0] if broader_kw else ""),
+                (broader_kw[0] if broader_kw else scene_words, broader_kw[1] if len(broader_kw) > 1 else "photo"),
+            ]
+            for web_attempt, (rq, rqa) in enumerate(retry_queries, 1):
+                try:
+                    _safe_print(f"[StockSearch] Scene {chunk.chunk_number}: web_image retry {web_attempt}/2 q='{rq[:50]}'")
+                    broader_analysis = dict(analysis)
+                    broader_analysis["search_query"] = rq
+                    broader_analysis["search_query_alt"] = rqa
+                    broader_result = stock_search_service.find_asset_for_scene(
+                        scene_id=chunk.chunk_number,
+                        analysis=broader_analysis,
+                        project_dir=project_dir,
+                        collection=collection,
+                        used_videos=set(),
+                        scene_text=chunk.scene_text or "",
+                        project_title=project_title,
+                    )
+                    broader_local = broader_result.get("local_path")
+                    if broader_local and not broader_local.endswith(".mp4"):
+                        update_kwargs["image_path"] = broader_local
+                        update_kwargs["asset_source"] = broader_result.get("asset_source", "web_search")
+                        local_path = broader_local
+                        if scene_asset_type == "web_image_full":
+                            vid_path = _render_fullscreen_image(broader_local, chunk, project_dir)
+                        else:
+                            vid_path = _render_web_image_animation(broader_local, chunk, _SimpleProject(collection), project_dir)
+                        if vid_path:
+                            update_kwargs["video_path"] = vid_path
+                        update_kwargs["status"] = ChunkStatus.done
+                        web_retry_success = True
+                        _safe_print(f"[StockSearch] Scene {chunk.chunk_number}: {scene_asset_type} retry {web_attempt}/2 SUCCESS")
+                        break
+                except Exception as exc:
+                    _safe_print(f"[StockSearch] Scene {chunk.chunk_number}: web_image retry {web_attempt}/2 error: {exc}")
+            if not web_retry_success:
+                update_kwargs["status"] = ChunkStatus.error
+                update_kwargs["error_message"] = "web_image: no se encontró imagen web tras múltiples reintentos"
+                _safe_print(f"[StockSearch] Scene {chunk.chunk_number}: web_image FAILED after all retries")
+        else:
+            if not local_path and cur_asset_type == "clip_bank":
+                # clip_bank MUST be video — retry with broader queries until we find one
+                _safe_print(f"[StockSearch] Scene {chunk.chunk_number}: clip_bank first search failed, retrying with broader queries...")
+                _log(db, project_id,
+                     f"🔄 [{idx}/{total}] Escena {chunk.chunk_number}: clip_bank reintentando con queries más amplios…",
+                     stage="stock_search")
+                title_short = (project_title or "").split(":")[0].strip()[:40]
+                scene_words = (chunk.scene_text or "")[:100].strip()
+                fallback_kw = (chunk.search_keywords or "").split("|")
+                cb_retry_queries = [
+                    (scene_words, fallback_kw[0] if fallback_kw else ""),
+                    (f"{title_short} {scene_words[:30]}", f"{title_short} movie scene"),
+                    (f"{title_short} behind the scenes", f"{title_short} film footage"),
+                    (f"{title_short} movie clip", "action movie scene"),
+                ]
+                cb_found = False
+                for cb_attempt, (cbq, cbqa) in enumerate(cb_retry_queries, 1):
+                    try:
+                        _safe_print(f"[StockSearch] Scene {chunk.chunk_number}: clip_bank retry {cb_attempt}/4 q='{cbq[:50]}'")
+                        cb_analysis = {
+                            "asset_type": "clip_bank",
+                            "search_query": cbq,
+                            "search_query_alt": cbqa,
+                        }
+                        cb_result = stock_search_service.find_asset_for_scene(
+                            scene_id=chunk.chunk_number,
+                            analysis=cb_analysis,
+                            project_dir=project_dir,
+                            collection=collection,
+                            used_videos=used_videos,
+                            min_duration=scene_duration,
+                            scene_text=chunk.scene_text or "",
+                            project_title=project_title,
+                        )
+                        cb_local = cb_result.get("local_path")
+                        if cb_local and cb_local.endswith(".mp4"):
+                            try:
+                                from .youtube_clip_service import _clean_clip
+                                _clean_clip(Path(cb_local))
+                            except Exception:
+                                pass
+                            if Path(cb_local).exists() and Path(cb_local).stat().st_size > 5000:
+                                update_kwargs["video_path"] = cb_local
+                                update_kwargs["asset_source"] = cb_result.get("asset_source", "clip_bank")
+                                update_kwargs["status"] = ChunkStatus.done
+                                local_path = cb_local
+                                found_counter[0] += 1
+                                cb_found = True
+                                # Track in used_videos
+                                with used_videos_lock:
+                                    if cb_result.get("origin_url"):
+                                        used_videos.add(cb_result["origin_url"])
+                                    if cb_result.get("youtube_id"):
+                                        used_videos.add(cb_result["youtube_id"])
+                                    used_videos.add(Path(cb_local).stem)
+                                _safe_print(f"[StockSearch] Scene {chunk.chunk_number}: clip_bank retry {cb_attempt}/4 SUCCESS")
+                                break
+                        # Got image or nothing — reject and try next query
+                        if cb_local and not cb_local.endswith(".mp4"):
+                            Path(cb_local).unlink(missing_ok=True)
+                    except Exception as exc:
+                        _safe_print(f"[StockSearch] Scene {chunk.chunk_number}: clip_bank retry {cb_attempt}/4 error: {exc}")
+                if not cb_found:
+                    update_kwargs["status"] = ChunkStatus.error
+                    update_kwargs["error_message"] = "clip_bank: no se encontró video tras 5 intentos"
+            elif not local_path:
+                _safe_print(f"[StockSearch] Scene {chunk.chunk_number}: {cur_asset_type} failed, falling back to web_image search...")
+                _log(db, project_id,
+                     f"🔄 [{idx}/{total}] Escena {chunk.chunk_number}: {cur_asset_type} sin resultado, buscando imagen web…",
+                     stage="stock_search")
+
+                title_short = (project_title or "").split(":")[0].strip()[:40]
+                fallback_kw = (chunk.search_keywords or "").split("|")
+                scene_words = (chunk.scene_text or "")[:100].strip()
+
+                fallback_queries = [
+                    (scene_words or fallback_kw[0] if fallback_kw else "cinematic scene",
+                     fallback_kw[0] if fallback_kw else ""),
+                    (f"{title_short} {scene_words[:30]}" if title_short else scene_words,
+                     f"{title_short} movie scene" if title_short else ""),
+                    (f"{title_short} movie photo" if title_short else "cinematic background",
+                     f"{title_short} film" if title_short else "movie scene"),
+                ]
+
+                fallback_ok = False
+                for fb_attempt, (fbq, fbqa) in enumerate(fallback_queries, 1):
+                    try:
+                        _safe_print(f"[StockSearch] Scene {chunk.chunk_number}: web_image fallback {fb_attempt}/3 q='{fbq[:50]}'")
+                        fb_analysis = {
+                            "asset_type": "web_image",
+                            "search_query": fbq,
+                            "search_query_alt": fbqa,
+                        }
+                        fb_result = stock_search_service.find_asset_for_scene(
+                            scene_id=chunk.chunk_number,
+                            analysis=fb_analysis,
+                            project_dir=project_dir,
+                            collection=collection,
+                            used_videos=set(),
+                            scene_text=chunk.scene_text or "",
+                            project_title=project_title,
+                        )
+                        fb_local = fb_result.get("local_path")
+                        if fb_local:
+                            if fb_local.endswith(".mp4"):
+                                update_kwargs["video_path"] = fb_local
+                            else:
+                                update_kwargs["image_path"] = fb_local
+                                vid_path = _render_web_image_animation(fb_local, chunk, _SimpleProject(collection), project_dir)
+                                if vid_path:
+                                    update_kwargs["video_path"] = vid_path
+                            update_kwargs["asset_source"] = fb_result.get("asset_source", "web_search")
+                            update_kwargs["status"] = ChunkStatus.done
+                            local_path = fb_local
+                            fallback_ok = True
+                            _safe_print(f"[StockSearch] Scene {chunk.chunk_number}: web_image fallback SUCCESS")
+                            break
+                    except Exception as exc:
+                        _safe_print(f"[StockSearch] Scene {chunk.chunk_number}: fallback {fb_attempt}/3 error: {exc}")
+
+                if not fallback_ok:
+                    update_kwargs["status"] = ChunkStatus.error
+                    update_kwargs["error_message"] = "sin asset tras búsqueda completa"
+
+        _update_chunk(db, chunk, **update_kwargs)
+
+        source = update_kwargs.get("asset_source", "?")
+        _log(db, project_id,
+             f"{'✅' if local_path else '⚠️'} [{idx}/{total}] Escena {chunk.chunk_number}: "
+             f"from {source}" + (f" → {Path(local_path).name}" if local_path else " → sin asset"),
+             stage="stock_search")
+
+    except Exception as exc:
+        _safe_print(f"[StockSearch] Scene thread error (chunk_id={chunk_id}): {exc}")
+        try:
+            _log(db, project_id,
+                 f"❌ Escena (chunk_id={chunk_id}): error en thread: {exc}",
+                 stage="stock_search", level="error")
+        except Exception:
+            pass
+    finally:
+        db.close()
+
 
 def _run_stock_asset_search(project_id: int) -> None:
     """Analyze scenes visually and search/download stock assets for each."""
@@ -976,7 +1547,14 @@ def _run_stock_asset_search(project_id: int) -> None:
             _safe_print(f"[StockSearch] Project {project_id} already generating_images, skipping duplicate run")
             return
 
-        _update_project(db, project, status=ProjectStatus.generating_images)
+        # Extract ALL project attributes upfront — avoids DetachedInstanceError after commits
+        _slug = project.slug
+        _collection = project.collection or "general"
+        _project_title = project.title or ""
+        _script_final = project.script_final or project.script or ""
+        del project  # Prevent accidental use of detached ORM object
+
+        _set_project_status(db, project_id, ProjectStatus.generating_images)
         _log(db, project_id, "🔍 Iniciando búsqueda de assets de stock…", stage="stock_search")
 
         chunks = (
@@ -987,12 +1565,12 @@ def _run_stock_asset_search(project_id: int) -> None:
         )
         if not chunks:
             _log(db, project_id, "No hay escenas para buscar assets.", stage="stock_search")
-            _update_project(db, project, status=ProjectStatus.images_ready)
+            _set_project_status(db, project_id, ProjectStatus.images_ready)
             return
 
         # Only clear assets for scenes that need (re)searching
         # Skip scenes that already have a valid video or image
-        _project_dir = PROJECTS_PATH / project.slug
+        _project_dir = PROJECTS_PATH / _slug
         assets_dir = _project_dir / "assets"
         chunks_to_search = []
         for c in chunks:
@@ -1005,6 +1583,10 @@ def _run_stock_asset_search(project_id: int) -> None:
 
             if has_valid_asset and str(c.status) == "ChunkStatus.done":
                 _safe_print(f"[StockSearch] Scene {c.chunk_number}: already has valid asset, skipping")
+                continue
+
+            # Skip queued chunks — only process pending ones
+            if str(c.status) == "ChunkStatus.queued":
                 continue
 
             # This scene needs searching — clear old assets
@@ -1028,7 +1610,7 @@ def _run_stock_asset_search(project_id: int) -> None:
 
         if not chunks_to_search:
             _log(db, project_id, "Todas las escenas ya tienen assets válidos.", stage="stock_search")
-            _update_project(db, project, status=ProjectStatus.images_ready)
+            _set_project_status(db, project_id, ProjectStatus.images_ready)
             return
 
         _log(db, project_id,
@@ -1068,12 +1650,9 @@ def _run_stock_asset_search(project_id: int) -> None:
                 {"id": c.chunk_number, "texto": c.scene_text or ""}
                 for c in unplanned_chunks
             ]
-            full_script = project.script_final or project.script or ""
-            collection = project.collection or "general"
-
             analyses = visual_analyzer_service.analyze_scenes(
-                full_script, scenes_for_analysis, collection,
-                project_title=project.title or "",
+                _script_final, scenes_for_analysis, _collection,
+                project_title=_project_title,
             )
             for a in analyses:
                 analysis_map[a["scene_id"]] = a
@@ -1083,352 +1662,214 @@ def _run_stock_asset_search(project_id: int) -> None:
              stage="stock_search")
 
         # Step 2: Search assets + generate AI fallback immediately per scene
-        project_dir = PROJECTS_PATH / project.slug
+        project_dir = PROJECTS_PATH / _slug
         total = len(chunks_to_search)
-        found_count = 0
+        found_counter = [0]  # mutable list for thread-safe counting
         used_videos: set = set()  # Track used video URLs to prevent duplicates
+        used_videos_lock = threading.Lock()
         # Pre-populate used_videos with existing assets from already-done scenes
         for c in chunks:
             if c.video_path:
                 used_videos.add(Path(c.video_path).stem)
+            if c.image_path:
+                used_videos.add(Path(c.image_path).stem)
+            # Add previously tracked YouTube IDs / origin URLs
+            if c.rejected_sources:
+                try:
+                    for rs in _json.loads(c.rejected_sources):
+                        used_videos.add(rs)
+                except Exception:
+                    pass
         poll_key = _get_pollinations_api_key(db)
 
+        # Build full script context so AI thinks like an editor who has read the entire script
+        _script_lines = []
+        for c in sorted(chunks, key=lambda x: x.chunk_number):
+            _script_lines.append(f"Scene {c.chunk_number} [{c.asset_type or '?'}]: {(c.scene_text or '')[:120]}")
+        _full_script_context = (
+            f"VIDEO TITLE: {_project_title}\n"
+            f"TOTAL SCENES: {len(chunks)}\n"
+            f"SCRIPT OVERVIEW:\n" + "\n".join(_script_lines[:50])  # Cap at 50 scenes to avoid token bloat
+        )
+
+        # Collect chunk IDs and analyses before spawning threads
+        scene_tasks = []
         for idx, chunk in enumerate(chunks_to_search, 1):
             analysis = analysis_map.get(chunk.chunk_number, {})
             if not analysis:
-                _log(db, project_id,
-                     f"⚠️ Escena {chunk.chunk_number}: sin análisis, usando fallback AI.",
-                     stage="stock_search", level="warning")
                 analysis = {"asset_type": "stock_video", "search_query": "nature landscape",
                             "search_query_alt": "aerial view"}
+            scene_tasks.append((idx, chunk.id, chunk.chunk_number, analysis))
 
-            _log(db, project_id,
-                 f"🔎 [{idx}/{total}] Escena {chunk.chunk_number}: "
-                 f"tipo={analysis.get('asset_type')}, query='{analysis.get('search_query')}'",
-                 stage="stock_search")
-
-            # Calculate scene duration from SRT timings
-            scene_duration = None
-            if chunk.start_ms is not None and chunk.end_ms is not None:
-                scene_duration = (chunk.end_ms - chunk.start_ms) / 1000.0
-
-            # ── Title card: render with Remotion instead of searching ──
-            scene_asset_type_pre = chunk.asset_type or analysis.get("asset_type", "")
-            if scene_asset_type_pre == "title_card":
-                raw_text = (chunk.overlay_text
-                            or analysis.get("overlay_text", "")
-                            or (chunk.scene_text or "")[:120].strip())
-                # Generate a SHORT title (2-5 words) instead of using full text
-                overlay = _generate_short_title(
-                    scene_text=chunk.scene_text or "",
-                    overlay_text=raw_text,
-                    project_title=project.title or "",
-                ) if raw_text else ""
-                if overlay:
-                    from .remotion_service import render_title_card
-
-                    # Step 1: Search for a background image
-                    bg_image_path = None
-                    _log(db, project_id,
-                         f"🖼️ [{idx}/{total}] Escena {chunk.chunk_number}: buscando imagen de fondo para título…",
-                         stage="stock_search")
-                    try:
-                        bg_analysis = dict(analysis)
-                        bg_analysis["asset_type"] = "web_image"  # Force web image search
-                        bg_result = stock_search_service.find_asset_for_scene(
-                            scene_id=chunk.chunk_number,
-                            analysis=bg_analysis,
-                            project_dir=project_dir,
-                            collection=project.collection or "general",
-                            used_videos=used_videos,
-                            min_duration=None,
-                            scene_text=chunk.scene_text or "",
-                            project_title=project.title or "",
-                        )
-                        bg_local = bg_result.get("local_path")
-                        if bg_local and not bg_local.endswith(".mp4"):
-                            bg_image_path = Path(bg_local)
-                            _log(db, project_id,
-                                 f"✅ [{idx}/{total}] Escena {chunk.chunk_number}: fondo encontrado → {Path(bg_local).name}",
-                                 stage="stock_search")
-                    except Exception as bg_exc:
-                        _safe_print(f"[TitleCard] Background search failed: {bg_exc}")
-
-                    # Step 2: Render title card with Remotion (with or without background)
-                    tc_path = project_dir / "assets" / f"title_{chunk.chunk_number}.mp4"
-                    tc_path.parent.mkdir(parents=True, exist_ok=True)
-                    tc_duration = scene_duration if scene_duration and scene_duration > 0 else 5.0
-                    bg_label = " + fondo" if bg_image_path else ""
-                    _log(db, project_id,
-                         f"📝 [{idx}/{total}] Escena {chunk.chunk_number}: renderizando título animado{bg_label} '{overlay[:50]}'…",
-                         stage="stock_search")
-                    tc_success = render_title_card(
-                        overlay, tc_path,
-                        duration_seconds=tc_duration,
-                        background_image=bg_image_path,
-                    )
-                    tc_kwargs = {"asset_type": "title_card", "overlay_text": overlay}
-                    if bg_image_path:
-                        tc_kwargs["image_path"] = str(bg_image_path)
-                    if tc_success:
-                        tc_kwargs["video_path"] = str(tc_path)
-                        tc_kwargs["asset_source"] = "remotion_title"
-                        tc_kwargs["status"] = ChunkStatus.done
-                        found_count += 1
-                        _log(db, project_id,
-                             f"✅ [{idx}/{total}] Escena {chunk.chunk_number}: título animado{bg_label} OK",
-                             stage="stock_search")
-                    else:
-                        tc_kwargs["status"] = ChunkStatus.error
-                        tc_kwargs["error_message"] = "Title card render failed"
-                        _log(db, project_id,
-                             f"❌ [{idx}/{total}] Escena {chunk.chunk_number}: error en título",
-                             stage="stock_search", level="warning")
-                    _update_chunk(db, chunk, **tc_kwargs)
-                    continue  # Skip normal stock search for title cards
-                # No text at all — mark error and skip
-                _update_chunk(db, chunk, status=ChunkStatus.error,
-                              error_message="Title card sin texto")
-                continue
-
-            result = stock_search_service.find_asset_for_scene(
-                scene_id=chunk.chunk_number,
-                analysis=analysis,
-                project_dir=project_dir,
-                collection=project.collection or "general",
-                used_videos=used_videos,
-                min_duration=scene_duration,
-                scene_text=chunk.scene_text or "",
-                project_title=project.title or "",
-            )
-
-            # Save youtube_id in rejected_sources for future Rebuscar
-            if result.get("youtube_id"):
-                import json as _json
-                try:
-                    existing = set()
-                    if chunk.rejected_sources:
-                        existing = set(_json.loads(chunk.rejected_sources))
-                    existing.add(result["youtube_id"])
-                    _update_chunk(db, chunk, rejected_sources=_json.dumps(list(existing)))
-                except Exception:
-                    pass
-
-            # Update chunk in DB — preserve planned asset_type
-            update_kwargs = {
-                "asset_source": result.get("asset_source"),
-            }
-            # Only overwrite asset_type if chunk had NO plan
-            if not chunk.asset_type:
-                update_kwargs["asset_type"] = result.get("asset_type_found")
-            if result.get("overlay_text"):
-                update_kwargs["overlay_text"] = result["overlay_text"]
-
-            local_path = result.get("local_path")
-            if local_path:
-                # Clean video clips (remove black bars, logos, text overlays)
-                if local_path.endswith(".mp4"):
-                    try:
-                        from .youtube_clip_service import _clean_clip
-                        _clean_clip(Path(local_path))
-                    except Exception as exc:
-                        _safe_print(f"[StockSearch] Clean clip error (non-fatal): {exc}")
-                    # Verify file still exists after cleaning
-                    if Path(local_path).exists() and Path(local_path).stat().st_size > 5000:
-                        update_kwargs["video_path"] = local_path
-                    else:
-                        _safe_print(f"[StockSearch] Scene {chunk.chunk_number}: video file missing after clean! {local_path}")
-                        local_path = None  # Reset so it's marked as error below
-                else:
-                    update_kwargs["image_path"] = local_path
-                    # For web_image scenes: render animated video from the image
-                    scene_type = chunk.asset_type or analysis.get("asset_type", "")
-                    if scene_type == "web_image":
-                        vid_path = _render_web_image_animation(local_path, chunk, project, project_dir)
-                        if vid_path:
-                            update_kwargs["video_path"] = vid_path
-                found_count += 1
-
-            # If no asset found, generate AI image IMMEDIATELY (no batch)
-            # NEVER use AI for web_image scenes — they must always use real web photos
-            cur_asset_type = chunk.asset_type or analysis.get("asset_type", "")
-            if not local_path and result.get("asset_type_found") == "ai_image" and cur_asset_type != "web_image":
-                try:
-                    prompt = analysis.get("search_query", chunk.scene_text or "abstract background")
-                    img_path = project_dir / "assets" / f"scene_{chunk.chunk_number}.jpg"
-                    img_path.parent.mkdir(parents=True, exist_ok=True)
-                    _log(db, project_id,
-                         f"🎨 Escena {chunk.chunk_number}: generando AI image… prompt='{prompt[:60]}'",
-                         stage="stock_search")
-                    _dispatch_generate_image(prompt, img_path, provider="pollinations", api_key=poll_key)
-                    if img_path.exists() and img_path.stat().st_size > 1000:
-                        update_kwargs["image_path"] = str(img_path)
-                        update_kwargs["asset_source"] = "pollinations"
-                        local_path = str(img_path)
-                        _log(db, project_id,
-                             f"✅ Escena {chunk.chunk_number}: AI image OK ({img_path.stat().st_size} bytes)",
-                             stage="stock_search")
-                    else:
-                        sz = img_path.stat().st_size if img_path.exists() else 0
-                        _log(db, project_id,
-                             f"⚠️ Escena {chunk.chunk_number}: AI image vacía o muy pequeña ({sz} bytes)",
-                             stage="stock_search", level="warning")
-                except Exception as exc:
-                    _log(db, project_id,
-                         f"❌ Escena {chunk.chunk_number}: AI image error: {exc}",
-                         stage="stock_search", level="warning")
-
-            # For web_image: if we have an image but no video yet, render animation
-            scene_asset_type = chunk.asset_type or analysis.get("asset_type", "")
-            if (scene_asset_type == "web_image"
-                    and local_path and not local_path.endswith(".mp4")
-                    and "video_path" not in update_kwargs):
-                vid_path = _render_web_image_animation(local_path, chunk, project, project_dir)
-                if vid_path:
-                    update_kwargs["video_path"] = vid_path
-
-            # Update chunk status based on search result
-            if local_path:
-                update_kwargs["status"] = ChunkStatus.done
-            elif scene_asset_type == "ai_image" and not local_path:
-                update_kwargs["status"] = ChunkStatus.error
-                update_kwargs["error_message"] = "AI image generation failed"
-            elif scene_asset_type == "web_image" and not local_path:
-                # web_image: retry up to 2 more times with varied queries
-                # (The search function itself already has last-resort + Pexels/Pixabay fallback)
-                _safe_print(f"[StockSearch] Scene {chunk.chunk_number}: web_image initial search failed, retrying...")
-                web_retry_success = False
-                broader_kw = (chunk.search_keywords or "").split("|")
-                scene_words = (chunk.scene_text or "")[:100].strip()
-                # Build varied queries for each attempt
-                retry_queries = [
-                    (scene_words, broader_kw[0] if broader_kw else ""),
-                    (broader_kw[0] if broader_kw else scene_words, broader_kw[1] if len(broader_kw) > 1 else "photo"),
-                ]
-                for web_attempt, (rq, rqa) in enumerate(retry_queries, 1):
-                    try:
-                        _safe_print(f"[StockSearch] Scene {chunk.chunk_number}: web_image retry {web_attempt}/2 q='{rq[:50]}'")
-                        broader_analysis = dict(analysis)
-                        broader_analysis["search_query"] = rq
-                        broader_analysis["search_query_alt"] = rqa
-                        broader_result = stock_search_service.find_asset_for_scene(
-                            scene_id=chunk.chunk_number,
-                            analysis=broader_analysis,
-                            project_dir=project_dir,
-                            collection=project.collection or "general",
-                            used_videos=set(),
-                            scene_text=chunk.scene_text or "",
-                            project_title=project.title or "",
-                        )
-                        broader_local = broader_result.get("local_path")
-                        if broader_local and not broader_local.endswith(".mp4"):
-                            update_kwargs["image_path"] = broader_local
-                            update_kwargs["asset_source"] = broader_result.get("asset_source", "web_search")
-                            local_path = broader_local
-                            vid_path = _render_web_image_animation(broader_local, chunk, project, project_dir)
-                            if vid_path:
-                                update_kwargs["video_path"] = vid_path
-                            update_kwargs["status"] = ChunkStatus.done
-                            web_retry_success = True
-                            _safe_print(f"[StockSearch] Scene {chunk.chunk_number}: web_image retry {web_attempt}/2 SUCCESS")
-                            break
-                    except Exception as exc:
-                        _safe_print(f"[StockSearch] Scene {chunk.chunk_number}: web_image retry {web_attempt}/2 error: {exc}")
-                if not web_retry_success:
-                    update_kwargs["status"] = ChunkStatus.error
-                    update_kwargs["error_message"] = f"web_image: no se encontró imagen web tras múltiples reintentos"
-                    _safe_print(f"[StockSearch] Scene {chunk.chunk_number}: web_image FAILED after all retries")
-            else:
-                # clip_bank/stock_video/etc. failed — FALLBACK to web_image search
-                # A scene must NEVER remain without an asset
-                _safe_print(f"[StockSearch] Scene {chunk.chunk_number}: {cur_asset_type} failed, falling back to web_image search...")
-                _log(db, project_id,
-                     f"🔄 [{idx}/{total}] Escena {chunk.chunk_number}: {cur_asset_type} sin resultado, buscando imagen web…",
-                     stage="stock_search")
-
-                title_short = (project.title or "").split(":")[0].strip()[:40]
-                fallback_kw = (chunk.search_keywords or "").split("|")
-                scene_words = (chunk.scene_text or "")[:100].strip()
-
-                # Try web_image with varied queries
-                fallback_queries = [
-                    # Query 1: scene text + original keywords
-                    (scene_words or fallback_kw[0] if fallback_kw else "cinematic scene",
-                     fallback_kw[0] if fallback_kw else ""),
-                    # Query 2: title + scene context
-                    (f"{title_short} {scene_words[:30]}" if title_short else scene_words,
-                     f"{title_short} movie scene" if title_short else ""),
-                    # Query 3: just title (very broad — will definitely find something)
-                    (f"{title_short} movie photo" if title_short else "cinematic background",
-                     f"{title_short} film" if title_short else "movie scene"),
-                ]
-
-                fallback_ok = False
-                for fb_attempt, (fbq, fbqa) in enumerate(fallback_queries, 1):
-                    try:
-                        _safe_print(f"[StockSearch] Scene {chunk.chunk_number}: web_image fallback {fb_attempt}/3 q='{fbq[:50]}'")
-                        fb_analysis = {
-                            "asset_type": "web_image",
-                            "search_query": fbq,
-                            "search_query_alt": fbqa,
-                        }
-                        fb_result = stock_search_service.find_asset_for_scene(
-                            scene_id=chunk.chunk_number,
-                            analysis=fb_analysis,
-                            project_dir=project_dir,
-                            collection=project.collection or "general",
-                            used_videos=set(),
-                            scene_text=chunk.scene_text or "",
-                            project_title=project.title or "",
-                        )
-                        fb_local = fb_result.get("local_path")
-                        if fb_local:
-                            if fb_local.endswith(".mp4"):
-                                update_kwargs["video_path"] = fb_local
-                            else:
-                                update_kwargs["image_path"] = fb_local
-                                # Render animated video from image
-                                vid_path = _render_web_image_animation(fb_local, chunk, project, project_dir)
-                                if vid_path:
-                                    update_kwargs["video_path"] = vid_path
-                            update_kwargs["asset_source"] = fb_result.get("asset_source", "web_search")
-                            update_kwargs["status"] = ChunkStatus.done
-                            local_path = fb_local
-                            fallback_ok = True
-                            _safe_print(f"[StockSearch] Scene {chunk.chunk_number}: web_image fallback SUCCESS")
-                            break
-                    except Exception as exc:
-                        _safe_print(f"[StockSearch] Scene {chunk.chunk_number}: fallback {fb_attempt}/3 error: {exc}")
-
-                if not fallback_ok:
-                    update_kwargs["status"] = ChunkStatus.error
-                    update_kwargs["error_message"] = "sin asset tras búsqueda completa"
-
-            _update_chunk(db, chunk, **update_kwargs)
-
-            source = update_kwargs.get("asset_source", "?")
-            _log(db, project_id,
-                 f"{'✅' if local_path else '⚠️'} [{idx}/{total}] Escena {chunk.chunk_number}: "
-                 f"from {source}" + (f" → {Path(local_path).name}" if local_path else " → sin asset"),
-                 stage="stock_search")
-
-        _update_project(db, project, status=ProjectStatus.images_ready)
         _log(db, project_id,
-             f"🎉 Búsqueda de assets completada: {found_count}/{total} encontrados en stock.",
+             f"🚀 Lanzando búsqueda paralela con 5 workers para {total} escenas…",
              stage="stock_search")
+        # Close the main DB session before spawning threads — each thread gets its own
+        db.close()
+
+        with ThreadPoolExecutor(max_workers=10) as pool:
+            futures = {}
+            for idx, chunk_id, chunk_number, analysis in scene_tasks:
+                future = pool.submit(
+                    _process_one_scene,
+                    project_id, chunk_id, analysis, project_dir,
+                    _collection,
+                    used_videos_lock, used_videos,
+                    found_counter, total, idx, poll_key,
+                    _project_title,
+                    script_context=_full_script_context,
+                )
+                futures[future] = chunk_number
+
+            for future in as_completed(futures):
+                scene_num = futures[future]
+                try:
+                    future.result()
+                except Exception as exc:
+                    _safe_print(f"[StockSearch] Scene {scene_num} thread error: {exc}")
+
+        # Re-open DB session for final status update
+        db = SessionLocal()
+        try:
+            _log(db, project_id,
+                 f"🎉 Búsqueda principal completada: {found_counter[0]}/{total} encontrados. Verificando escenas sin clip…",
+                 stage="stock_search")
+        finally:
+            db.close()
+
+        # ── Final verification: retry all scenes without a valid clip ──────
+        _run_final_verification(project_id, project_dir, _collection, project_title, used_videos, used_videos_lock)
 
     except Exception as exc:
-        db.rollback()
+        # Always use a fresh session for error handling — the original db may be closed
         try:
-            project = db.query(Project).filter(Project.id == project_id).first()
-            if project:
-                _update_project(db, project, status=ProjectStatus.error,
-                                error_message=str(exc))
+            db.close()
+        except Exception:
+            pass
+        db = SessionLocal()
+        try:
+            _set_project_status(db, project_id, ProjectStatus.error, error_message=str(exc))
             _log(db, project_id,
                  f"Error en búsqueda de assets: {exc}\n{traceback.format_exc()}",
                  stage="stock_search", level="error")
         except Exception:
             print(f"[CRITICAL] Failed to log stock search error for project {project_id}")
+        finally:
+            db.close()
+
+
+def _run_final_verification(
+    project_id: int,
+    project_dir: Path,
+    collection: str,
+    project_title: str,
+    used_videos: set,
+    used_videos_lock: threading.Lock,
+) -> None:
+    """Retry all scenes that ended in error/pending (no clip) up to 3 rounds."""
+    MAX_ROUNDS = 3
+
+    for round_num in range(1, MAX_ROUNDS + 1):
+        db = SessionLocal()
+        try:
+            # Find scenes without a valid video/image
+            missing = db.query(Chunk).filter(
+                Chunk.project_id == project_id,
+                Chunk.status.in_([ChunkStatus.error, ChunkStatus.pending, ChunkStatus.queued]),
+            ).all()
+
+            # Also check "done" scenes where file is actually missing
+            done_chunks = db.query(Chunk).filter(
+                Chunk.project_id == project_id,
+                Chunk.status == ChunkStatus.done,
+            ).all()
+            for c in done_chunks:
+                has_file = False
+                if c.video_path and Path(c.video_path).exists():
+                    has_file = True
+                elif c.image_path and Path(c.image_path).exists():
+                    has_file = True
+                if not has_file:
+                    missing.append(c)
+
+            if not missing:
+                _log(db, project_id,
+                     f"✅ Verificación ronda {round_num}: todas las {len(done_chunks)} escenas tienen clip.",
+                     stage="stock_search")
+                _set_project_status(db, project_id, ProjectStatus.images_ready)
+                return
+
+            missing_ids = [(c.id, c.chunk_number) for c in missing]
+            _log(db, project_id,
+                 f"🔄 Verificación ronda {round_num}/{MAX_ROUNDS}: {len(missing)} escenas sin clip. Reintentando…",
+                 stage="stock_search")
+        finally:
+            db.close()
+
+        # Reset missing chunks to pending
+        db2 = SessionLocal()
+        try:
+            for chunk_id, chunk_num in missing_ids:
+                chunk = db2.query(Chunk).filter(Chunk.id == chunk_id).first()
+                if chunk:
+                    chunk.status = ChunkStatus.pending
+                    chunk.error_message = None
+            db2.commit()
+        finally:
+            db2.close()
+
+        # Re-run parallel search on missing scenes
+        found_counter = [0]
+        total_missing = len(missing_ids)
+
+        with ThreadPoolExecutor(max_workers=10) as pool:
+            futures = {}
+            for idx, (chunk_id, chunk_number) in enumerate(missing_ids, 1):
+                # Build a generic analysis to force re-search
+                future = pool.submit(
+                    _process_one_scene,
+                    project_id=project_id,
+                    chunk_id=chunk_id,
+                    analysis=None,
+                    project_dir=project_dir,
+                    collection=collection,
+                    used_videos_lock=used_videos_lock,
+                    used_videos=used_videos,
+                    found_counter=found_counter,
+                    total=total_missing,
+                    idx=idx,
+                    poll_key="stock_search",
+                    project_title=project_title,
+                    script_context=_full_script_context if '_full_script_context' in dir() else "",
+                )
+                futures[future] = chunk_number
+
+            for future in as_completed(futures):
+                scene_num = futures[future]
+                try:
+                    future.result()
+                except Exception as exc:
+                    _safe_print(f"[Verify] Round {round_num} scene {scene_num} error: {exc}")
+
+        _safe_print(f"[Verify] Round {round_num} done: {found_counter[0]}/{total_missing} recovered")
+
+    # After all rounds, set final status
+    db = SessionLocal()
+    try:
+        still_missing = db.query(Chunk).filter(
+            Chunk.project_id == project_id,
+            Chunk.status.in_([ChunkStatus.error, ChunkStatus.pending, ChunkStatus.queued]),
+        ).count()
+        total = db.query(Chunk).filter(Chunk.project_id == project_id).count()
+        _set_project_status(db, project_id, ProjectStatus.images_ready)
+        if still_missing > 0:
+            _log(db, project_id,
+                 f"⚠️ Verificación final: {still_missing}/{total} escenas aún sin clip tras {MAX_ROUNDS} rondas.",
+                 stage="stock_search")
+        else:
+            _log(db, project_id,
+                 f"✅ Verificación final: todas las {total} escenas tienen clip.",
+                 stage="stock_search")
     finally:
         db.close()
 
@@ -2200,6 +2641,18 @@ def _run_retry_chunk_image(project_id: int, chunk_number: int) -> None:
 
             project_dir = PROJECTS_PATH / project.slug
 
+            # Build script context for editorial AI decisions
+            _all_chunks = db.query(Chunk).filter(Chunk.project_id == project_id).order_by(Chunk.chunk_number).all()
+            _retry_script_lines = [
+                f"Scene {c.chunk_number} [{c.asset_type or '?'}]: {(c.scene_text or '')[:120]}"
+                for c in _all_chunks[:50]
+            ]
+            _retry_script_context = (
+                f"VIDEO TITLE: {project.title or ''}\n"
+                f"TOTAL SCENES: {len(_all_chunks)}\n"
+                f"SCRIPT OVERVIEW:\n" + "\n".join(_retry_script_lines)
+            )
+
             # ── Title card: re-render with Remotion ──
             if (chunk.asset_type or "") == "title_card":
                 raw_text = chunk.overlay_text or (chunk.scene_text or "")[:120].strip()
@@ -2277,17 +2730,29 @@ def _run_retry_chunk_image(project_id: int, chunk_number: int) -> None:
             if old_hash:
                 rejected_set.add(f"hash:{old_hash}")
 
-            # Also collect all youtube_ids from OTHER chunks in this project
+            # Also collect all youtube_ids AND image hashes from OTHER chunks
             # to avoid duplicating across scenes
             all_chunks = db.query(Chunk).filter(
                 Chunk.project_id == project_id,
                 Chunk.chunk_number != chunk_number,
-                Chunk.video_path.isnot(None),
+            ).filter(
+                (Chunk.video_path.isnot(None)) | (Chunk.image_path.isnot(None))
             ).all()
             sibling_used = set()
             for sc in all_chunks:
                 if sc.video_path:
                     sibling_used.add(Path(sc.video_path).stem)
+                if sc.image_path:
+                    sibling_used.add(Path(sc.image_path).stem)
+                    # Add image hash to prevent identical images across scenes
+                    try:
+                        img_p = Path(sc.image_path)
+                        if img_p.exists() and img_p.stat().st_size > 0:
+                            import hashlib
+                            h = hashlib.md5(img_p.read_bytes()).hexdigest()
+                            sibling_used.add(f"hash:{h}")
+                    except Exception:
+                        pass
                 try:
                     if sc.rejected_sources:
                         sibling_used.update(_json.loads(sc.rejected_sources))
@@ -2301,8 +2766,49 @@ def _run_retry_chunk_image(project_id: int, chunk_number: int) -> None:
                  f"{len(sibling_used)} de otras escenas",
                  stage=f"retry_media_{chunk_number}")
 
-            # Build analysis from chunk's existing plan
+            # Build analysis — for clip_bank, regenerate keywords with Claude
+            # so each retry uses DIFFERENT search terms automatically
+            is_clip_bank_retry = (chunk.asset_type or "") == "clip_bank"
             kw = (chunk.search_keywords or "").split("|")
+
+            if is_clip_bank_retry:
+                # Generate fresh, contextual keywords using Claude
+                try:
+                    _log(db, project_id,
+                         f"[Retry {chunk_number}] Generando nuevos keywords con Claude…",
+                         stage=f"retry_media_{chunk_number}")
+                    scene_text = chunk.scene_text or ""
+                    title = project.title or ""
+                    attempt_num = len(rejected_set)  # more rejected = broader queries
+                    from .visual_analyzer_service import _call_claude_api
+                    regen_prompt = (
+                        f"You are a professional video editor searching YouTube for B-roll footage.\n"
+                        f"Video title: \"{title}\"\n"
+                        f"Scene narration: \"{scene_text}\"\n"
+                        f"Previous keywords that FAILED: {kw}\n"
+                        f"Attempt number: {attempt_num}\n\n"
+                        f"Generate 2 YouTube search queries (in English) that would find REAL VIDEO "
+                        f"footage matching this scene. Think about what the viewer should SEE.\n"
+                        f"The queries should be DIFFERENT from the failed ones.\n"
+                        f"Return ONLY two lines, nothing else:\n"
+                        f"LINE1: primary search query (5-8 words)\n"
+                        f"LINE2: alternative search query (5-8 words)"
+                    )
+                    regen_result = _call_claude_api(regen_prompt)
+                    lines = [l.strip() for l in regen_result.strip().split("\n") if l.strip()]
+                    new_q1 = lines[0] if lines else kw[0] if kw else "food product review"
+                    new_q2 = lines[1] if len(lines) > 1 else kw[1] if len(kw) > 1 else "supermarket shopping"
+                    # Clean any "LINE1:" prefixes
+                    for prefix in ("LINE1:", "LINE2:", "1.", "2.", "Primary:", "Alternative:"):
+                        new_q1 = new_q1.replace(prefix, "").strip()
+                        new_q2 = new_q2.replace(prefix, "").strip()
+                    _safe_print(f"[Retry] Scene {chunk_number}: regenerated keywords: '{new_q1}' | '{new_q2}'")
+                    kw = [new_q1, new_q2]
+                    # Save new keywords for next retry
+                    _update_chunk(db, chunk, search_keywords=f"{new_q1}|{new_q2}")
+                except Exception as exc:
+                    _safe_print(f"[Retry] Scene {chunk_number}: keyword regen failed: {exc}")
+
             analysis = {
                 "asset_type": chunk.asset_type or "web_image",
                 "search_query": kw[0] if kw else "nature landscape",
@@ -2310,10 +2816,6 @@ def _run_retry_chunk_image(project_id: int, chunk_number: int) -> None:
                 "has_overlay_text": bool(chunk.overlay_text),
                 "overlay_text": chunk.overlay_text,
             }
-
-            # For clip_bank retry, SKIP the remote clip bank (it doesn't track
-            # rejected sources) and force local YouTube search via Claude
-            is_clip_bank_retry = (chunk.asset_type or "") == "clip_bank"
 
             # Calculate scene duration for min_duration
             scene_dur = None
@@ -2330,7 +2832,7 @@ def _run_retry_chunk_image(project_id: int, chunk_number: int) -> None:
                 scene_text=chunk.scene_text or "",
                 project_title=project.title or "",
                 reject_hash=old_hash,
-                skip_remote_bank=is_clip_bank_retry,
+                script_context=_retry_script_context,
             )
 
             # Save rejected sources for next Rebuscar
@@ -2346,6 +2848,16 @@ def _run_retry_chunk_image(project_id: int, chunk_number: int) -> None:
 
             local_path = result.get("local_path")
             update_kwargs = {"asset_source": result.get("asset_source")}
+
+            # clip_bank: ONLY accept real video (.mp4), reject images
+            retry_asset_type = chunk.asset_type or analysis.get("asset_type", "")
+            if local_path and retry_asset_type == "clip_bank" and not local_path.endswith(".mp4"):
+                _safe_print(f"[Retry] Scene {chunk_number}: clip_bank rejecting non-video: {local_path}")
+                try:
+                    Path(local_path).unlink(missing_ok=True)
+                except Exception:
+                    pass
+                local_path = None
 
             if local_path:
                 # Clean video clips (remove black bars, logos, text)
@@ -2366,9 +2878,16 @@ def _run_retry_chunk_image(project_id: int, chunk_number: int) -> None:
                         local_path = None  # Force fallback below
                 else:
                     update_kwargs["image_path"] = local_path
-                    # For web_image scenes: render animated video from the image
+                    # For image-based scenes: render animated video from the image
                     retry_scene_type = chunk.asset_type or analysis.get("asset_type", "")
-                    if retry_scene_type == "web_image":
+                    if retry_scene_type == "web_image_full":
+                        try:
+                            vid_path = _render_fullscreen_image(local_path, chunk, project_dir)
+                            if vid_path:
+                                update_kwargs["video_path"] = vid_path
+                        except Exception as exc:
+                            _safe_print(f"[Retry] FullscreenImage error (non-fatal): {exc}")
+                    elif retry_scene_type in ("web_image", "stock_video", "archive_footage", "space_media"):
                         try:
                             from .remotion_service import render_image_scene
                             vid_out = project_dir / "videos" / f"imgscene_{chunk.chunk_number}.mp4"
@@ -2377,7 +2896,7 @@ def _run_retry_chunk_image(project_id: int, chunk_number: int) -> None:
                             if r_dur <= 0:
                                 r_dur = 5.0
                             r_niche = project.collection or "general"
-                            _safe_print(f"[Retry] Rendering ImageScene for scene {chunk.chunk_number}")
+                            _safe_print(f"[Retry] Rendering ImageScene for scene {chunk.chunk_number} (type={retry_scene_type})")
                             ok = render_image_scene(
                                 image_path=Path(local_path),
                                 output_path=vid_out,
@@ -2394,8 +2913,8 @@ def _run_retry_chunk_image(project_id: int, chunk_number: int) -> None:
                 # Stock search failed
                 retry_type = chunk.asset_type or analysis.get("asset_type", "")
 
-                if retry_type == "web_image":
-                    # web_image: retry with varied queries — each attempt uses different search terms
+                if retry_type in ("web_image", "web_image_full"):
+                    # web_image / web_image_full: retry with varied queries — each attempt uses different search terms
                     _log(db, project_id,
                          f"[Retry {chunk_number}] Búsqueda web sin resultados, reintentando con queries variados…",
                          stage=f"retry_media_{chunk_number}")
@@ -2436,21 +2955,129 @@ def _run_retry_chunk_image(project_id: int, chunk_number: int) -> None:
                             if broader_local and not broader_local.endswith(".mp4"):
                                 update_kwargs["image_path"] = broader_local
                                 update_kwargs["asset_source"] = broader_result.get("asset_source", "web_search")
-                                vid_path = _render_web_image_animation(broader_local, chunk, project, project_dir)
+                                if retry_type == "web_image_full":
+                                    vid_path = _render_fullscreen_image(broader_local, chunk, project_dir)
+                                else:
+                                    vid_path = _render_web_image_animation(broader_local, chunk, project, project_dir)
                                 if vid_path:
                                     update_kwargs["video_path"] = vid_path
                                 update_kwargs["status"] = ChunkStatus.done
                                 retry_web_ok = True
-                                _safe_print(f"[Retry] Scene {chunk_number}: web_image attempt {web_att}/3 SUCCESS")
+                                _safe_print(f"[Retry] Scene {chunk_number}: {retry_type} attempt {web_att}/3 SUCCESS")
                                 break
                         except Exception as exc:
                             _safe_print(f"[Retry] Scene {chunk_number}: web_image attempt {web_att}/3 error: {exc}")
                     if not retry_web_ok:
                         update_kwargs["status"] = ChunkStatus.error
                         update_kwargs["error_message"] = f"No se encontró imagen web tras 3 reintentos"
+                elif retry_type == "clip_bank":
+                    # clip_bank MUST stay clip_bank — retry with broader queries, never fall back to web_image
+                    _safe_print(f"[Retry] Scene {chunk_number}: clip_bank failed, retrying with broader queries...")
+                    _log(db, project_id,
+                         f"[Retry {chunk_number}] clip_bank reintentando con queries más amplios…",
+                         stage=f"retry_media_{chunk_number}")
+
+                    title_short = (project.title or "").split(":")[0].strip()[:40]
+                    fb_scene = (chunk.scene_text or "")[:80].strip()
+                    fb_kw = (chunk.search_keywords or "").split("|")
+
+                    cb_retry_queries = [
+                        (fb_scene or fb_kw[0] if fb_kw else "documentary footage",
+                         fb_kw[0] if fb_kw else ""),
+                        (f"{title_short} {fb_scene[:30]}" if title_short else fb_scene,
+                         f"{title_short} documentary" if title_short else ""),
+                        # Last resort: very broad search that will always find something
+                        (f"{title_short}" if title_short else "documentary footage",
+                         "food production documentary" if "comida" in (project.collection or "").lower() else "documentary footage"),
+                    ]
+
+                    cb_found = False
+                    for cb_att, (cbq, cbqa) in enumerate(cb_retry_queries, 1):
+                        try:
+                            _safe_print(f"[Retry] Scene {chunk_number}: clip_bank retry {cb_att}/{len(cb_retry_queries)} q='{cbq[:50]}'")
+                            cb_analysis = {
+                                "asset_type": "clip_bank",
+                                "search_query": cbq,
+                                "search_query_alt": cbqa,
+                            }
+                            cb_result = stock_search_service.find_asset_for_scene(
+                                scene_id=chunk.chunk_number,
+                                analysis=cb_analysis,
+                                project_dir=project_dir,
+                                collection=project.collection or "general",
+                                used_videos=all_used,
+                                min_duration=scene_dur,
+                                scene_text=chunk.scene_text or "",
+                                project_title=project.title or "",
+                                            )
+                            cb_local = cb_result.get("local_path")
+                            if cb_local and cb_local.endswith(".mp4"):
+                                try:
+                                    from .youtube_clip_service import _clean_clip
+                                    _clean_clip(Path(cb_local))
+                                except Exception:
+                                    pass
+                                if Path(cb_local).exists() and Path(cb_local).stat().st_size > 5000:
+                                    update_kwargs["video_path"] = cb_local
+                                    update_kwargs["asset_source"] = cb_result.get("asset_source", "clip_bank")
+                                    update_kwargs["status"] = ChunkStatus.done
+                                    if cb_result.get("youtube_id"):
+                                        rejected_set.add(cb_result["youtube_id"])
+                                    rejected_set.add(Path(cb_local).stem)
+                                    cb_found = True
+                                    _safe_print(f"[Retry] Scene {chunk_number}: clip_bank retry {cb_att}/4 SUCCESS")
+                                    break
+                            # Got image or nothing — reject and try next
+                            if cb_local and not cb_local.endswith(".mp4"):
+                                Path(cb_local).unlink(missing_ok=True)
+                        except Exception as exc:
+                            _safe_print(f"[Retry] Scene {chunk_number}: clip_bank retry {cb_att}/4 error: {exc}")
+
+                    if not cb_found:
+                        update_kwargs["status"] = ChunkStatus.error
+                        update_kwargs["error_message"] = "clip_bank: no se encontró video tras 5 intentos"
+
+                elif retry_type == "ai_image":
+                    # ai_image: generate with Pollinations (the CORRECT behavior)
+                    _safe_print(f"[Retry] Scene {chunk_number}: ai_image — generating with Pollinations...")
+                    _log(db, project_id,
+                         f"[Retry {chunk_number}] Generando imagen AI con Pollinations…",
+                         stage=f"retry_media_{chunk_number}")
+                    try:
+                        scene_narration = chunk.scene_text or ""
+                        search_hint = (chunk.search_keywords or "").split("|")[0]
+                        try:
+                            prompt = generate_image_prompt(
+                                narration=scene_narration,
+                                visual_description=f"{search_hint}. Video title: {project.title or ''}",
+                            )
+                        except Exception:
+                            prompt = f"Cinematic photorealistic image of {search_hint}, dramatic lighting, 4K"
+                        _safe_print(f"[AIImage] Scene {chunk_number}: prompt: {prompt[:100]}")
+                        img_path = project_dir / "assets" / f"scene_{chunk_number}.jpg"
+                        img_path.parent.mkdir(parents=True, exist_ok=True)
+                        poll_key = _get_pollinations_api_key(db)
+                        _dispatch_generate_image(prompt, img_path, provider="pollinations", api_key=poll_key)
+                        if img_path.exists() and img_path.stat().st_size > 1000:
+                            update_kwargs["image_path"] = str(img_path)
+                            update_kwargs["asset_source"] = "pollinations"
+                            # Render fullscreen zoom (like web_image_full) for AI images
+                            vid_path = _render_fullscreen_image(str(img_path), chunk, project_dir)
+                            if vid_path:
+                                update_kwargs["video_path"] = vid_path
+                            update_kwargs["status"] = ChunkStatus.done
+                            _safe_print(f"[AIImage] Scene {chunk_number}: SUCCESS ({img_path.stat().st_size} bytes)")
+                        else:
+                            update_kwargs["status"] = ChunkStatus.error
+                            update_kwargs["error_message"] = "AI image generation failed (empty or too small)"
+                    except Exception as exc:
+                        _safe_print(f"[AIImage] Scene {chunk_number}: error: {exc}")
+                        update_kwargs["status"] = ChunkStatus.error
+                        update_kwargs["error_message"] = f"AI image error: {exc}"
+
                 else:
-                    # Non web_image (clip_bank, stock_video, etc.) failed
-                    # FALLBACK: try web_image search before AI generation
+                    # Non clip_bank, non web_image, non ai_image (stock_video, etc.) failed
+                    # FALLBACK: try web_image search (respects that these types CAN use images)
                     _safe_print(f"[Retry] Scene {chunk_number}: {retry_type} failed, falling back to web_image...")
                     _log(db, project_id,
                          f"[Retry {chunk_number}] {retry_type} sin resultado, buscando imagen web…",
@@ -3001,4 +3628,124 @@ def _run_animate_scenes(project_id: int) -> None:
 
 def start_animate_scenes(project_id: int) -> None:
     t = threading.Thread(target=_run_animate_scenes, args=(project_id,), daemon=True)
+    t.start()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Whisper recalibration — fix chunk start_ms/end_ms using real speech timing
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _run_recalibrate_timestamps(project_id: int) -> None:
+    """Recalibrate chunk timestamps using Whisper word-level analysis.
+
+    Preserves scene_text, assets, transitions. Only updates start_ms, end_ms
+    and re-slices per-chunk audio files.
+    """
+    db = SessionLocal()
+    try:
+        project = db.query(Project).filter(Project.id == project_id).first()
+        if not project:
+            return
+
+        slug = project.slug
+        vo = voiceover_dir(slug)
+        audio_complete = vo / "audio-completo.mp3"
+
+        if not audio_complete.exists():
+            _log(db, project_id, "audio-completo.mp3 not found — cannot recalibrate.",
+                 stage="recalibrate", level="error")
+            return
+
+        _log(db, project_id, "Running Whisper word-level transcription...",
+             stage="recalibrate")
+
+        # 1. Get word-level timestamps from Whisper
+        from .openai_service import transcribe_word_timestamps
+        whisper_words = transcribe_word_timestamps(audio_complete)
+
+        _log(db, project_id,
+             f"Whisper returned {len(whisper_words)} word timestamps.",
+             stage="recalibrate")
+
+        # 2. Load existing chunks
+        chunks = (db.query(Chunk)
+                  .filter(Chunk.project_id == project_id)
+                  .order_by(Chunk.chunk_number)
+                  .all())
+
+        if not chunks:
+            _log(db, project_id, "No chunks to recalibrate.", stage="recalibrate")
+            return
+
+        chunks_data = [
+            {"chunk_number": c.chunk_number, "scene_text": c.scene_text or ""}
+            for c in chunks
+        ]
+
+        # 3. Recalibrate timestamps
+        from .claude_service import recalibrate_chunk_timestamps
+        new_ts = recalibrate_chunk_timestamps(chunks_data, whisper_words)
+
+        # 4. Update chunks in DB
+        ts_map = {t["chunk_number"]: t for t in new_ts}
+        updated = 0
+        for chunk in chunks:
+            ts = ts_map.get(chunk.chunk_number)
+            if ts:
+                old_s, old_e = chunk.start_ms, chunk.end_ms
+                _update_chunk(db, chunk, start_ms=ts["start_ms"], end_ms=ts["end_ms"])
+                if old_s != ts["start_ms"] or old_e != ts["end_ms"]:
+                    updated += 1
+
+        _log(db, project_id,
+             f"Updated timestamps for {updated}/{len(chunks)} chunks.",
+             stage="recalibrate")
+
+        # 5. Re-slice audio chunks
+        _log(db, project_id, "Re-slicing per-chunk audio files...",
+             stage="recalibrate")
+        for chunk in chunks:
+            n = chunk.chunk_number
+            start_sec = (chunk.start_ms or 0) / 1000.0
+            duration_sec = max(((chunk.end_ms or 0) - (chunk.start_ms or 0)) / 1000.0, 0.1)
+            scene_audio = vo / f"audio-chunk-{n}.mp3"
+            try:
+                _slice_mp3(audio_complete, scene_audio, start_sec, duration_sec)
+                _update_chunk(db, chunk, audio_path=str(scene_audio))
+            except Exception as exc:
+                _log(db, project_id,
+                     f"[Chunk {n}] re-slice failed: {exc}",
+                     stage="recalibrate", level="warning")
+
+        # 6. Invalidate preview if exists
+        preview_in_dir = PROJECTS_PATH / slug / "preview.mp4"
+        if project.preview_path or preview_in_dir.exists():
+            for pf in [preview_in_dir, Path(project.preview_path or "")]:
+                try:
+                    if pf.exists():
+                        pf.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            project.preview_path = None
+            project.preview_progress = 0
+            db.commit()
+            _log(db, project_id, "Invalidated existing preview.mp4.",
+                 stage="recalibrate")
+
+        _log(db, project_id,
+             f"Recalibration complete. {updated} chunks updated.",
+             stage="recalibrate")
+
+    except Exception as exc:
+        _log(db, project_id,
+             f"Recalibration error: {exc}\n{traceback.format_exc()}",
+             stage="recalibrate", level="error")
+    finally:
+        db.close()
+
+
+def start_recalibrate_timestamps(project_id: int) -> None:
+    t = threading.Thread(
+        target=_run_recalibrate_timestamps, args=(project_id,), daemon=True
+    )
     t.start()

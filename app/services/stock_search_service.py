@@ -10,12 +10,19 @@ import sys
 import requests
 from pathlib import Path
 from typing import Optional, Dict, Tuple
+from openai import OpenAI as _OpenAI
 from ..config import settings
 from . import pexels_service, pixabay_service
 from . import ddg_image_service  # only for _is_blocked watermark check
 from . import web_image_service
 from . import visual_analyzer_service
 from . import youtube_clip_service
+
+_MODEL = "google/gemini-3.1-flash-lite-preview"
+_openrouter = _OpenAI(
+    api_key=settings.openrouter_api_key,
+    base_url="https://openrouter.ai/api/v1",
+)
 
 
 def _safe_print(msg: str) -> None:
@@ -195,48 +202,6 @@ def search_nara(query: str) -> Optional[Dict]:
         return None
 
 
-# ── Clip bank ───────────────────────────────────────────────────────────────
-
-def search_clip_bank(query: str, collection: str = "general") -> Optional[Dict]:
-    """Search internal clip bank API.
-
-    If collection == 'general', no collection filter is applied (returns clips
-    from all collections). Otherwise, filters by the specific collection name.
-
-    Returns dict with local_path + media_type, or None if not found.
-    """
-    clip_bank_url = settings.clip_bank_url if hasattr(settings, "clip_bank_url") else ""
-    if not clip_bank_url:
-        return None  # clip bank not configured
-
-    try:
-        params: dict = {"q": query, "limit": 5}
-        if collection and collection != "general":
-            params["collection"] = collection
-
-        _safe_print(f"[ClipBank] Searching: '{query}'" +
-                    (f" (collection={collection})" if collection != "general" else " (all collections)"))
-
-        resp = requests.get(clip_bank_url, params=params, timeout=(1.5, 10))
-        resp.raise_for_status()
-        data = resp.json()
-        items = data.get("results", [])
-        if not items:
-            _safe_print(f"[ClipBank] No results for '{query}'")
-            return None
-
-        item = items[0]
-        file_path = item.get("file_path") or item.get("path") or item.get("url")
-        media_type = item.get("media_type", "video")
-        if file_path:
-            _safe_print(f"[ClipBank] Found {media_type}: {file_path}")
-            return {"local_path": file_path, "media_type": media_type}
-
-        return None
-    except Exception as exc:
-        _safe_print(f"[ClipBank] Search error: {exc}")
-        return None
-
 
 # ── Download helper ─────────────────────────────────────────────────────────
 
@@ -308,6 +273,18 @@ def download_asset(url: str, dest: Path, require_landscape: bool = False) -> boo
             _safe_print(f"[Download] File too small ({dest.stat().st_size}B): {dest}")
             dest.unlink(missing_ok=True)
             return False
+        # Verify file is actually an image/video, not HTML/text
+        with open(dest, "rb") as check_f:
+            head = check_f.read(16)
+        _IMAGE_SIGS = (b'\xff\xd8', b'\x89PNG', b'GIF8', b'RIFF', b'BM')
+        _VIDEO_SIGS = (b'\x00\x00\x00', b'\x1a\x45\xdf\xa3')  # mp4/webm
+        is_media = any(head.startswith(s) for s in _IMAGE_SIGS + _VIDEO_SIGS)
+        if not is_media and head[8:12] == b'WEBP':
+            is_media = True
+        if not is_media:
+            _safe_print(f"[Download] Not a real image/video (header={head[:8]}): {dest.name}")
+            dest.unlink(missing_ok=True)
+            return False
         # Check landscape aspect ratio for images
         if require_landscape and dest.suffix.lower() in ('.jpg', '.jpeg', '.png', '.webp'):
             dims = _get_image_dimensions(dest)
@@ -337,13 +314,9 @@ def find_asset_for_scene(
     scene_text: str = "",
     project_title: str = "",
     reject_hash: str | None = None,
-    skip_remote_bank: bool = False,
+    script_context: str = "",
 ) -> Dict:
     """Find and download the best asset for a scene.
-
-    If clip_bank_url is configured, delegates the entire search to the clip bank
-    server (which handles the full search chain: local clips, YouTube, Pexels, etc.).
-    Falls back to local search functions if the bank is unavailable.
 
     Returns:
         dict with: asset_type_found, asset_source, local_path, overlay_text
@@ -377,31 +350,14 @@ def find_asset_for_scene(
     if used_videos is None:
         used_videos = set()
 
-    # ── Try clip bank (delegates entire search chain) ────────────────────────
-    # Only use clip bank for types that need video (clip_bank, stock_video, archive, space)
-    # Skip for web_image (needs static images from DDG)
-    clip_bank_url = settings.clip_bank_url if hasattr(settings, "clip_bank_url") else ""
-    if clip_bank_url and asset_type not in ("web_image", "title_card") and not skip_remote_bank:
-        bank_result = _search_via_clip_bank(
-            clip_bank_url, scene_id, query, query_alt, asset_type,
-            collection, video_dest, image_dest, used_videos,
-            min_duration=min_duration,
-        )
-        if bank_result:
-            result.update(**bank_result)
-            _safe_print(
-                f"[StockSearch] Scene {scene_id}: FOUND {result['asset_type_found']} "
-                f"from {result['asset_source']} -> {result['local_path']}"
-            )
-            return result
-
-    # ── Fallback: local search (clip bank unavailable or didn't find) ────────
-    _safe_print(f"[StockSearch] Scene {scene_id}: using local fallback search")
-    if asset_type == "web_image":
-        # Web image — search + validate with AI vision
+    # ── Search by asset type ────────────────────────────────────────────────
+    _safe_print(f"[StockSearch] Scene {scene_id}: searching locally")
+    if asset_type in ("web_image", "web_image_full"):
+        # Web image / Imagen Completa — search + validate with AI vision
         result = _search_web_image(scene_id, query, query_alt, image_dest, result,
                                    scene_text=scene_text, project_title=project_title,
-                                   used_urls=used_videos, reject_hash=reject_hash)
+                                   used_urls=used_videos, reject_hash=reject_hash,
+                                   collection=collection)
     elif asset_type == "clip_bank":
         # clip_bank: search YouTube, download and cut a clip using Claude + yt-dlp
         _safe_print(f"[StockSearch] Scene {scene_id}: clip_bank — searching YouTube via Claude...")
@@ -419,6 +375,7 @@ def find_asset_for_scene(
             collection=collection,
             used_urls=used_videos,
             reject_hashes=_reject_hashes if _reject_hashes else None,
+            script_context=script_context,
         )
         if yt_result:
             result.update(
@@ -455,96 +412,6 @@ def find_asset_for_scene(
     return result
 
 
-def _search_via_clip_bank(
-    bank_url: str, scene_id: int, query: str, query_alt: str,
-    asset_type: str, collection: str, video_dest: Path, image_dest: Path,
-    used_videos: set | None = None,
-    min_duration: float | None = None,
-) -> Optional[Dict]:
-    """Call the clip bank's /api/clips/find endpoint. Returns partial result dict or None."""
-    try:
-        # Use scene duration as min_duration (clip must be >= scene length)
-        req_min = max(3, int(min_duration)) if min_duration else 3
-        # For clip_bank, force video-only search on PC1
-        force_video = asset_type == "clip_bank"
-        payload = {
-            "query": query,
-            "query_alt": query_alt,
-            "collection": collection,
-            "asset_type": asset_type,
-            "media_type": "video" if force_video else None,
-            "min_duration": req_min,
-            "max_duration": max(req_min + 10, 30),
-            "exclude_urls": list(used_videos) if used_videos else [],
-        }
-        # Remove None values
-        payload = {k: v for k, v in payload.items() if v is not None}
-        _safe_print(f"[ClipBank] POST /api/clips/find  query='{query}' col={collection} min_dur={req_min}s")
-        resp = requests.post(f"{bank_url}/api/clips/find", json=payload, timeout=(3, 120))
-
-        if resp.status_code != 200:
-            _safe_print(f"[ClipBank] HTTP {resp.status_code}")
-            return None
-
-        data = resp.json()
-        if not data.get("found"):
-            _safe_print(f"[ClipBank] No result for '{query}'")
-            return None
-
-        # Download the clip from the bank
-        download_url = data.get("download_url", "")
-        source = data.get("source", "clip_bank")
-        media_type = data.get("media_type", "video")
-        dest = video_dest if media_type == "video" else image_dest
-        full_url = f"{bank_url}{download_url}" if download_url.startswith("/") else download_url
-
-        # clip_bank scenes MUST get video, reject images
-        if asset_type == "clip_bank" and media_type != "video":
-            _safe_print(f"[ClipBank] Scene needs video but got {media_type}, skipping")
-            return None
-
-        # Block watermarked image sources
-        origin_url = data.get("origin_url") or download_url
-        if media_type == "image" and ddg_image_service._is_blocked(origin_url):
-            _safe_print(f"[ClipBank] Skipping watermarked image: {origin_url[:80]}")
-            return None
-
-        # Check if this URL was already used by another scene
-        if used_videos and origin_url in used_videos:
-            _safe_print(f"[ClipBank] Skipping duplicate: {origin_url}")
-            return None
-
-        # For clip_bank, ALWAYS save as .mp4 regardless of what PC1 says
-        if asset_type == "clip_bank":
-            dest = video_dest
-
-        _safe_print(f"[ClipBank] Found {media_type} from {source}, downloading...")
-        if download_asset(full_url, dest):
-            # Verify: for clip_bank, check magic bytes to confirm it's a real video
-            if asset_type == "clip_bank":
-                with open(dest, "rb") as f:
-                    header = f.read(12)
-                # JPEG starts with FF D8, PNG with 89 50 4E 47 — these are NOT video
-                if header[:2] == b'\xff\xd8' or header[:4] == b'\x89PNG':
-                    _safe_print(f"[ClipBank] File is actually an IMAGE, not video. Removing.")
-                    dest.unlink(missing_ok=True)
-                    return None
-                # Valid video: MP4 has 'ftyp' at byte 4, or starts with other video signatures
-                if b'ftyp' not in header and not header[:4] == b'\x1a\x45\xdf\xa3':  # webm
-                    _safe_print(f"[ClipBank] File doesn't look like video (header={header[:8].hex()}). Removing.")
-                    dest.unlink(missing_ok=True)
-                    return None
-            if used_videos is not None:
-                used_videos.add(origin_url)
-            return {"asset_type_found": media_type, "asset_source": source, "local_path": str(dest)}
-
-        _safe_print(f"[ClipBank] Download failed")
-        return None
-
-    except Exception as exc:
-        _safe_print(f"[ClipBank] Error: {exc}")
-        return None
-
 
 def _search_stock_video(scene_id, query, query_alt, video_dest, image_dest, result,
                         scene_text="", project_title="", used_urls: set | None = None,
@@ -564,37 +431,93 @@ def _search_stock_video(scene_id, query, query_alt, video_dest, image_dest, resu
         if used_urls is not None:
             used_urls.add(url.split("?")[0].lower())
 
-    # 1. Pexels video — primary query
-    url = _try_pexels_video(query)
-    if url and not _is_used(url) and download_asset(url, video_dest):
+    video_validations = 0
+    max_video_validations = 3
+
+    def _try_stock_video(url, q, source):
+        """Download and validate a stock video with vision AI."""
+        nonlocal video_validations
+        if not url or _is_used(url):
+            return False
+        if not download_asset(url, video_dest):
+            return False
+        # Validate with vision AI — extract a frame and check relevance
+        if video_validations < max_video_validations and scene_text:
+            video_validations += 1
+            try:
+                import subprocess as _sp, tempfile as _tf
+                with _tf.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+                    tmp_frame = tmp.name
+                _sp.run(
+                    ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+                     "-of", "default=noprint_wrappers=1:nokey=1", str(video_dest)],
+                    capture_output=True, text=True, timeout=10,
+                )
+                _sp.run(
+                    ["ffmpeg", "-y", "-ss", "1", "-i", str(video_dest),
+                     "-vframes", "1", "-q:v", "3", tmp_frame],
+                    capture_output=True, text=True, timeout=15,
+                )
+                from pathlib import Path as _P
+                frame_p = _P(tmp_frame)
+                if frame_p.exists() and frame_p.stat().st_size > 500:
+                    if not visual_analyzer_service.validate_image(
+                        frame_p, scene_text, q, project_title
+                    ):
+                        _safe_print(f"[StockVideo] Scene {scene_id}: video REJECTED by vision ({source}, validation {video_validations}/{max_video_validations})")
+                        frame_p.unlink(missing_ok=True)
+                        video_dest.unlink(missing_ok=True)
+                        return False
+                frame_p.unlink(missing_ok=True)
+            except Exception as exc:
+                _safe_print(f"[StockVideo] Scene {scene_id}: video validation error ({exc}), accepting")
         _mark_used(url)
-        result.update(asset_type_found="video", asset_source="pexels", local_path=str(video_dest))
+        result.update(asset_type_found="video", asset_source=source, local_path=str(video_dest))
+        return True
+
+    # 1. Pexels video — primary query
+    if _try_stock_video(_try_pexels_video(query), query, "pexels"):
         return result
 
     # 2. Pexels video — alt query
-    if query_alt:
-        url = _try_pexels_video(query_alt)
-        if url and not _is_used(url) and download_asset(url, video_dest):
-            _mark_used(url)
-            result.update(asset_type_found="video", asset_source="pexels", local_path=str(video_dest))
-            return result
+    if query_alt and _try_stock_video(_try_pexels_video(query_alt), query_alt, "pexels"):
+        return result
 
     # 3. Pixabay video — primary query
-    url = _try_pixabay_video(query)
-    if url and not _is_used(url) and download_asset(url, video_dest):
-        _mark_used(url)
-        result.update(asset_type_found="video", asset_source="pixabay", local_path=str(video_dest))
+    if _try_stock_video(_try_pixabay_video(query), query, "pixabay"):
         return result
 
     # 4. Pixabay video — alt query
-    if query_alt:
-        url = _try_pixabay_video(query_alt)
-        if url and not _is_used(url) and download_asset(url, video_dest):
-            _mark_used(url)
-            result.update(asset_type_found="video", asset_source="pixabay", local_path=str(video_dest))
-            return result
+    if query_alt and _try_stock_video(_try_pixabay_video(query_alt), query_alt, "pixabay"):
+        return result
 
-    # Image fallbacks — validate with Gemini to ensure relevance
+    # 5. YouTube video fallback — real video footage (before image fallback)
+    _safe_print(f"[StockVideo] Scene {scene_id}: Pexels/Pixabay unavailable, trying YouTube...")
+    _reject_hashes = set()
+    if used_urls:
+        _reject_hashes = {h.split(":", 1)[1] for h in used_urls if h.startswith("hash:")}
+    yt_result = youtube_clip_service.find_youtube_clip(
+        scene_text=scene_text,
+        search_query=query,
+        search_query_alt=query_alt or "",
+        project_title=project_title,
+        min_duration=3.0,
+        dest_path=video_dest,
+        collection="general",
+        used_urls=used_urls,
+        reject_hashes=_reject_hashes if _reject_hashes else None,
+    )
+    if yt_result:
+        result.update(
+            asset_type_found="video",
+            asset_source=yt_result["asset_source"],
+            local_path=yt_result["local_path"],
+            youtube_id=yt_result.get("youtube_id", ""),
+            youtube_title=yt_result.get("youtube_title", ""),
+        )
+        return result
+
+    # Image fallbacks (last resort) — validate with Gemini to ensure relevance
     max_validations = 5
     validations_done = 0
 
@@ -665,13 +588,13 @@ def _file_hash(path: Path) -> str | None:
 
 
 def _generate_image_queries_with_claude(scene_text: str, project_title: str,
-                                         original_query: str, original_query_alt: str) -> list[str]:
-    """Use Claude (local subscription) to generate highly specific image search queries.
+                                         original_query: str, original_query_alt: str,
+                                         collection: str = "general") -> list[str]:
+    """Use Gemini Flash Lite via OpenRouter to generate highly specific image search queries.
 
     Returns a list of 3-4 search queries optimized for finding the EXACT image
     that matches what the scene is talking about.
     """
-    import subprocess as _sp
     import json as _json
     import re as _re
 
@@ -701,50 +624,65 @@ def _generate_image_queries_with_claude(scene_text: str, project_title: str,
         f'- Query 3: behind-the-scenes or production angle\n'
         f'- Query 4: related but different visual angle\n'
         f'- Query 5: broader/simpler version that will definitely find results\n\n'
+    )
+
+    # Inject collection-specific rules
+    col_lower = (collection or "general").lower()
+    _is_comida = col_lower.startswith("comida") or "comida" in col_lower
+    if _is_comida:
+        prompt += (
+            f'COLLECTION-SPECIFIC RULES (FOOD/PRODUCT UK):\n'
+            f'This video is about UK supermarket food products. Queries MUST target product packaging, brand imagery, and store-specific content.\n'
+            f'- ALWAYS include the supermarket brand name if mentioned in the scene (Tesco, Morrisons, Co-op, Lidl, Asda, M&S, Sainsburys, Aldi, Iceland, Waitrose)\n'
+            f'- Query 1: exact product + brand + "packaging UK" (e.g., "Tesco beef mince 20% fat packaging")\n'
+            f'- Query 2: product on shelf or in store (e.g., "supermarket meat aisle beef mince UK")\n'
+            f'- Query 3: production/manufacturing process (e.g., "ground beef factory production line")\n'
+            f'- Query 4: brand logo or store exterior (e.g., "Tesco store front UK")\n'
+            f'- Query 5: broader product search (e.g., "beef mince package UK")\n'
+            f'- NEVER search for cooked food, recipes, or generic stock food images\n'
+            f'- NEVER use stock-style queries like "fresh meat on cutting board"\n\n'
+        )
+
+    prompt += (
         f'Return ONLY a JSON array of 5 strings, nothing else.\n'
         f'Example: ["Independence Day 1996 Oscar visual effects award", "69th Academy Awards best visual effects winner", '
         f'"Independence Day 1996 special effects making of", "Independence Day movie VFX team", '
         f'"Independence Day 1996 film photo"]'
     )
 
-    # Retry up to 3 times on timeout/error
+    # Retry up to 3 times on error
     for attempt in range(1, 4):
         try:
-            _safe_print(f"[WebImg] Claude query gen attempt {attempt}/3...")
-            result = _sp.run(
-                ["claude", "-p", prompt],
-                capture_output=True, text=True, timeout=90,
-                encoding="utf-8", errors="replace",
+            _safe_print(f"[WebImg] API query gen attempt {attempt}/3...")
+            resp = _openrouter.chat.completions.create(
+                model=_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=1024,
+                temperature=0.3,
             )
-            if result.returncode != 0:
-                _safe_print(f"[WebImg] Claude query gen error (attempt {attempt}/3): {result.stderr[:200]}")
-                continue  # retry
+            text = resp.choices[0].message.content.strip()
 
-            text = result.stdout.strip()
             match = _re.search(r'\[.*\]', text, _re.DOTALL)
             if match:
                 queries = _json.loads(match.group())
                 if isinstance(queries, list) and len(queries) >= 1:
-                    _safe_print(f"[WebImg] Claude generated {len(queries)} queries: {queries}")
+                    _safe_print(f"[WebImg] API generated {len(queries)} queries: {queries}")
                     return [str(q) for q in queries[:5]]
 
-            _safe_print(f"[WebImg] Claude returned non-JSON (attempt {attempt}/3), retrying...")
+            _safe_print(f"[WebImg] API returned non-JSON (attempt {attempt}/3), retrying...")
             continue
 
-        except _sp.TimeoutExpired:
-            _safe_print(f"[WebImg] Claude query gen TIMEOUT (attempt {attempt}/3, 90s)")
-            continue
         except Exception as exc:
-            _safe_print(f"[WebImg] Claude query gen failed (attempt {attempt}/3): {exc}")
+            _safe_print(f"[WebImg] API query gen failed (attempt {attempt}/3): {exc}")
             continue
 
-    _safe_print(f"[WebImg] Claude query gen FAILED after 3 attempts, using original queries")
+    _safe_print(f"[WebImg] API query gen FAILED after 3 attempts, using original queries")
     return fallback
 
 
 def _search_web_image(scene_id, query, query_alt, image_dest, result,
                       scene_text="", project_title="", used_urls: set | None = None,
-                      reject_hash: str | None = None):
+                      reject_hash: str | None = None, collection: str = "general"):
     """Search web for IMAGES only (no video).
 
     Uses Claude to generate optimized search queries, then searches
@@ -753,6 +691,8 @@ def _search_web_image(scene_id, query, query_alt, image_dest, result,
     """
     max_validations = 10  # Limit AI validation calls per search round
     validations_done = 0
+    col_lower = (collection or "general").lower()
+    _is_comida = col_lower.startswith("comida") or "comida" in col_lower
 
     def _is_used(url):
         if not used_urls:
@@ -771,16 +711,23 @@ def _search_web_image(scene_id, query, query_alt, image_dest, result,
             return False
         if not download_asset(url, image_dest, require_landscape=True):
             return False
-        # Reject if identical to the old image (retry must produce a different image)
-        if reject_hash and _file_hash(image_dest) == reject_hash:
-            _safe_print(f"[WebImg] Scene {scene_id}: SKIP same image as before (hash match)")
-            image_dest.unlink(missing_ok=True)
-            return False
+        # Reject if identical to old image or any sibling scene image
+        dl_hash = _file_hash(image_dest)
+        if dl_hash:
+            if reject_hash and dl_hash == reject_hash:
+                _safe_print(f"[WebImg] Scene {scene_id}: SKIP same image as before (hash match)")
+                image_dest.unlink(missing_ok=True)
+                return False
+            # Check against sibling hashes (stored as "hash:xxx" in used_urls)
+            if used_urls and f"hash:{dl_hash}" in used_urls:
+                _safe_print(f"[WebImg] Scene {scene_id}: SKIP duplicate image from another scene (hash match)")
+                image_dest.unlink(missing_ok=True)
+                return False
         # Validate with Claude Vision if we haven't exhausted validation budget
         if validations_done < max_validations and scene_text:
             validations_done += 1
             if not visual_analyzer_service.validate_image(
-                image_dest, scene_text, q, project_title
+                image_dest, scene_text, q, project_title, collection=collection
             ):
                 # Image rejected — delete and try next
                 _safe_print(f"[WebImg] Scene {scene_id}: REJECTED by Claude Vision (validation {validations_done}/{max_validations})")
@@ -794,7 +741,7 @@ def _search_web_image(scene_id, query, query_alt, image_dest, result,
     # ── Step 1: Use Claude to generate optimized search queries ──
     _safe_print(f"[WebImg] Scene {scene_id}: asking Claude for better search queries...")
     smart_queries = _generate_image_queries_with_claude(
-        scene_text, project_title, query, query_alt
+        scene_text, project_title, query, query_alt, collection=collection
     )
 
     # ── Step 2: Search with each query until we find a valid image ──
@@ -843,13 +790,18 @@ def _search_web_image(scene_id, query, query_alt, image_dest, result,
             return False
         if not download_asset(url, image_dest, require_landscape=False):
             return False
-        if reject_hash and _file_hash(image_dest) == reject_hash:
+        fl_hash = _file_hash(image_dest)
+        if fl_hash and reject_hash and fl_hash == reject_hash:
+            image_dest.unlink(missing_ok=True)
+            return False
+        if fl_hash and used_urls and f"hash:{fl_hash}" in used_urls:
+            _safe_print(f"[WebImg] Scene {scene_id}: SKIP duplicate from sibling (flexible)")
             image_dest.unlink(missing_ok=True)
             return False
         if validations_done < max_validations and scene_text:
             validations_done += 1
             if not visual_analyzer_service.validate_image(
-                image_dest, scene_text, q, project_title, flexible=True
+                image_dest, scene_text, q, project_title, flexible=True, collection=collection
             ):
                 _safe_print(f"[WebImg] Scene {scene_id}: {source_name} REJECTED even in flexible mode ({validations_done}/{max_validations})")
                 image_dest.unlink(missing_ok=True)
@@ -863,12 +815,20 @@ def _search_web_image(scene_id, query, query_alt, image_dest, result,
     title_prefix = (project_title or "").split(":")[0].strip()[:40]
     title_queries = []
     if title_prefix:
-        title_queries = [
-            f"{title_prefix} behind the scenes",
-            f"{title_prefix} movie photo",
-            f"{title_prefix} film production",
-            f"{title_prefix} real photo",
-        ]
+        if _is_comida:
+            title_queries = [
+                f"{title_prefix} product UK",
+                f"{title_prefix} UK supermarket",
+                f"{title_prefix} packaging",
+                f"{title_prefix} nutrition label",
+            ]
+        else:
+            title_queries = [
+                f"{title_prefix} behind the scenes",
+                f"{title_prefix} movie photo",
+                f"{title_prefix} film production",
+                f"{title_prefix} real photo",
+            ]
     for tq in title_queries:
         try:
             candidates = web_image_service.search_image_candidates(tq, max_per_source=5)
@@ -881,14 +841,33 @@ def _search_web_image(scene_id, query, query_alt, image_dest, result,
         except Exception:
             pass
 
-    # 4b. Try Pexels/Pixabay
-    for q in [query, query_alt]:
-        if not q:
-            continue
-        for src_name, fn in [("pexels", _try_pexels_image), ("pixabay", _try_pixabay_image)]:
-            url = fn(q)
-            if url and _try_flexible(url, q, src_name):
-                return result
+    # 4b. Try Pexels/Pixabay (skip for comida — stock sites don't have branded products)
+    if _is_comida:
+        # For comida: additional web searches with product-specific queries instead
+        comida_extra = [
+            f"{query} packaging UK",
+            f"{query} supermarket shelf",
+            f"{query} product label",
+        ]
+        for cq in comida_extra:
+            try:
+                candidates = web_image_service.search_image_candidates(cq, max_per_source=5)
+                _safe_print(f"[WebImg] Scene {scene_id}: comida-query '{cq}' -> {len(candidates)} candidates")
+                for url in candidates:
+                    if validations_done >= max_validations:
+                        break
+                    if _try_flexible(url, cq, "web_search"):
+                        return result
+            except Exception:
+                pass
+    else:
+        for q in [query, query_alt]:
+            if not q:
+                continue
+            for src_name, fn in [("pexels", _try_pexels_image), ("pixabay", _try_pixabay_image)]:
+                url = fn(q)
+                if url and _try_flexible(url, q, src_name):
+                    return result
 
     # 4c. Try simplified scene text queries
     simple_words = " ".join((scene_text or query)[:60].split()[:5])
@@ -904,14 +883,15 @@ def _search_web_image(scene_id, query, query_alt, image_dest, result,
         except Exception:
             pass
 
-    # 4d. Try Pexels/Pixabay with title-based queries (broader)
-    stock_queries = [title_prefix, f"{title_prefix} movie", f"{title_prefix} film"]
-    if title_prefix:
-        for sq in stock_queries:
-            for src_name, fn in [("pexels", _try_pexels_image), ("pixabay", _try_pixabay_image)]:
-                url = fn(sq)
-                if url and _try_flexible(url, sq, src_name):
-                    return result
+    # 4d. Try Pexels/Pixabay with title-based queries (broader) — skip for comida
+    if not _is_comida:
+        stock_queries = [title_prefix, f"{title_prefix} movie", f"{title_prefix} film"]
+        if title_prefix:
+            for sq in stock_queries:
+                for src_name, fn in [("pexels", _try_pexels_image), ("pixabay", _try_pixabay_image)]:
+                    url = fn(sq)
+                    if url and _try_flexible(url, sq, src_name):
+                        return result
 
     # ── Step 5: ÚLTIMO RECURSO — accept ANY image without AI validation ──
     # Better to have a related image than no image at all.
@@ -919,11 +899,18 @@ def _search_web_image(scene_id, query, query_alt, image_dest, result,
 
     last_resort_queries = []
     if title_prefix:
-        last_resort_queries.extend([
-            f"{title_prefix}",
-            f"{title_prefix} movie scene",
-            f"{title_prefix} film",
-        ])
+        if _is_comida:
+            last_resort_queries.extend([
+                f"{title_prefix} product UK",
+                f"{title_prefix} supermarket",
+                f"{title_prefix} food UK",
+            ])
+        else:
+            last_resort_queries.extend([
+                f"{title_prefix}",
+                f"{title_prefix} movie scene",
+                f"{title_prefix} film",
+            ])
     # Add scene-specific keywords
     scene_keywords = " ".join((scene_text or "")[:80].split()[:6])
     if scene_keywords:
@@ -963,14 +950,14 @@ def _search_web_image(scene_id, query, query_alt, image_dest, result,
                     return result
         except Exception:
             pass
-        # Try Pexels
-        url = _try_pexels_image(lrq)
-        if url and _try_no_validation(url, "pexels_lastresort"):
-            return result
-        # Try Pixabay
-        url = _try_pixabay_image(lrq)
-        if url and _try_no_validation(url, "pixabay_lastresort"):
-            return result
+        # Try Pexels/Pixabay (skip for comida — stock sites don't have branded products)
+        if not _is_comida:
+            url = _try_pexels_image(lrq)
+            if url and _try_no_validation(url, "pexels_lastresort"):
+                return result
+            url = _try_pixabay_image(lrq)
+            if url and _try_no_validation(url, "pixabay_lastresort"):
+                return result
 
     _safe_print(f"[WebImg] Scene {scene_id}: ABSOLUTELY NOTHING found after all 5 steps")
     return result
