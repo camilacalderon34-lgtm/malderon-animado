@@ -16,3 +16,7 @@ youtube-transcript-api==1.2.4
 google-genai>=1.0.0
 playwright>=1.40.0
 mutagen>=1.47.0
+yt-dlp>=2024.0.0
+duckduckgo_search>=6.0.0
+pillow>=10.0.0
+beautifulsoup4>=4.12.0
