@@ -309,11 +309,26 @@ def get_project(project_id: int, db: Session = Depends(get_db)):
 
 @router.delete("/{project_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_project(project_id: int, db: Session = Depends(get_db)):
+    import time as _time
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
-    db.delete(project)
-    db.commit()
+    # Retry up to 3 times to handle SQLite busy/lock from background pipeline threads
+    for attempt in range(3):
+        try:
+            db.delete(project)
+            db.commit()
+            return
+        except Exception as exc:
+            db.rollback()
+            if attempt < 2:
+                _time.sleep(1)
+                # Re-fetch after rollback
+                project = db.query(Project).filter(Project.id == project_id).first()
+                if not project:
+                    return  # Already deleted by another request
+            else:
+                raise HTTPException(status_code=503, detail=f"Could not delete project (busy): {exc}")
 
 
 @router.post("/{project_id}/approve-script", response_model=ProjectOut)

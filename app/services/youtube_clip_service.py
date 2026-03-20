@@ -451,8 +451,13 @@ Return ONLY a JSON object:
         claude_resp = re.sub(r"^```(?:json)?\s*", "", claude_resp)
         claude_resp = re.sub(r"\s*```$", "", claude_resp)
         analysis = json.loads(claude_resp)
-        start = max(0, float(analysis.get("start_seconds", 5)))
-        clip_dur = max(min_duration, float(analysis.get("clip_duration", min_duration + 3)))
+        def _safe_float(val, default):
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                return float(default)
+        start = max(0, _safe_float(analysis.get("start_seconds"), 5))
+        clip_dur = max(min_duration, _safe_float(analysis.get("clip_duration"), min_duration + 3))
 
         # Sanity check: ensure we don't go past the end
         if start + clip_dur > src_duration:

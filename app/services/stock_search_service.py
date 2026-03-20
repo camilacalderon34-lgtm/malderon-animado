@@ -49,7 +49,8 @@ def search_nasa_media(query: str) -> Optional[Dict]:
             return None
 
         for item in items[:5]:
-            data = item.get("data", [{}])[0]
+            data_list = item.get("data") or [{}]
+            data = data_list[0] if data_list else {}
             media_type = data.get("media_type", "")
             href = item.get("href", "")
             if not href:
