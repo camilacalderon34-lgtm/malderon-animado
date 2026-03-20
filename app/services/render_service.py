@@ -254,11 +254,20 @@ def _prepare_chunk_clip(
     video_src = Path(chunk.video_path) if chunk.video_path else None
     image_src = Path(chunk.image_path) if chunk.image_path else None
 
-    if video_src and video_src.exists():
+    if video_src and video_src.exists() and _ffprobe_duration(video_src) > 0:
         _log(db, project_id,
              f"[Render {n}] Normalizando clip ({target:.1f}s)…",
              stage="render_clip")
-        _normalize_clip(video_src, out, target)
+        try:
+            _normalize_clip(video_src, out, target)
+        except RuntimeError:
+            _log(db, project_id,
+                 f"[Render {n}] ⚠️ Clip corrupto, usando fallback",
+                 stage="render_clip", level="warning")
+            if image_src and image_src.exists():
+                _image_to_video(image_src, out, target)
+            else:
+                _black_placeholder(out, target)
     elif image_src and image_src.exists():
         _log(db, project_id,
              f"[Render {n}] Imagen → video estático ({target:.1f}s)…",
@@ -681,8 +690,17 @@ def _run_preview_render(project_id: int) -> None:
             video_src = Path(chunk.video_path) if chunk.video_path else None
             image_src = Path(chunk.image_path) if chunk.image_path else None
 
-            if video_src and video_src.exists():
-                _normalize_clip(video_src, out, target, width=960, height=540)
+            if video_src and video_src.exists() and _ffprobe_duration(video_src) > 0:
+                try:
+                    _normalize_clip(video_src, out, target, width=960, height=540)
+                except RuntimeError:
+                    _log(db, project_id,
+                         f"⚠️ Clip corrupto #{chunk.chunk_number}, usando placeholder",
+                         stage="preview")
+                    if image_src and image_src.exists():
+                        _image_to_video(image_src, out, target, w=960, h=540)
+                    else:
+                        _black_placeholder(out, target, w=960, h=540)
             elif image_src and image_src.exists():
                 _image_to_video(image_src, out, target, w=960, h=540)
             else:

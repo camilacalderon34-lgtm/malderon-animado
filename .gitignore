@@ -72,3 +72,14 @@ test_screenshots/
 
 # Remotion
 remotion/node_modules/
+remotion/tmp*.json
+remotion/public/
+
+# Test / temp media
+test_*.mp4
+test_*.m4a
+review_frames/
+static/test_video.html
+
+# Cookies / credentials
+youtube_cookies.txt

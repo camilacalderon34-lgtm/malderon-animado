@@ -11,14 +11,21 @@ from ..config import settings
 
 
 # ── Numbered entry detection (for countdown/list videos) ─────────────────────
-# Matches: "Number 1,", "Number 10.", "#1 ", "#10:", "10. ", "1. ", etc.
+# Matches: "Number 1,", "Number 10.", "Number one.", "#1 ", "#10:", "10. ", "1. ", etc.
+_WORD_NUMBERS = r"(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen)"
 _RE_NUMBERED = re.compile(
-    r"^\s*(?:Number\s+\d+|#\s*\d+|\d{1,2}\.)\s*[,:.]?\s",
+    rf"^\s*(?:Number\s+(?:\d+|{_WORD_NUMBERS})|#\s*\d+|\d{{1,2}}\.)\s*[,:.]?\s",
     re.IGNORECASE,
 )
 # Matches through the title portion (everything up to first period or colon after number+title)
 _RE_TITLE_END = re.compile(
-    r"^\s*(?:Number\s+\d+|#\s*\d+|\d{1,2}\.)\s*[,:.]?\s*[^.:]+[.:]",
+    rf"^\s*(?:Number\s+(?:\d+|{_WORD_NUMBERS})|#\s*\d+|\d{{1,2}}\.)\s*[,:.]?\s*[^.:]+[.:]",
+    re.IGNORECASE,
+)
+
+
+_RE_NUMBER_LABEL = re.compile(
+    rf"Number\s+(?:\d+|{_WORD_NUMBERS})\s*[,:.]\s*",
     re.IGNORECASE,
 )
 
@@ -456,6 +463,164 @@ def _split_srt_into_blocks(srt_content: str, block_duration_ms: int = 60000) -> 
     return result
 
 
+_WORD_TO_DIGIT = {
+    "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
+    "six": "6", "seven": "7", "eight": "8", "nine": "9", "ten": "10",
+    "eleven": "11", "twelve": "12", "thirteen": "13", "fourteen": "14", "fifteen": "15",
+}
+
+
+def _normalize_number_label(label: str) -> str:
+    """Convert 'Number two:' to 'number 2' for comparison."""
+    low = label.lower().rstrip(" ,.:")
+    for word, digit in _WORD_TO_DIGIT.items():
+        low = re.sub(rf"\b{word}\b", digit, low)
+    return low
+
+
+def _restore_missing_number_labels(scenes: list, original_text: str) -> list:
+    """Restore any 'Number X.' labels that Sonnet dropped during division.
+
+    Compares the original script against the scene output. If 'Number two:' exists
+    in the original but no scene starts with 'Number two' or 'Number 2', finds the
+    scene containing the text that follows it and prepends the label.
+    """
+    labels_in_original = list(_RE_NUMBER_LABEL.finditer(original_text))
+    _safe_print(f"[SceneDivision] _restore_missing_number_labels: {len(labels_in_original)} labels in original, {len(scenes)} scenes")
+    if not labels_in_original:
+        return scenes
+
+    repaired = 0
+    for match in labels_in_original:
+        label = match.group(0).strip()  # e.g. "Number two:"
+        norm_label = _normalize_number_label(label)  # "number 2"
+
+        # Check if any scene already starts with this label (word OR digit form)
+        # Use word boundary to avoid "number 1" matching "number 10"
+        label_pattern = re.compile(rf"^{re.escape(norm_label)}\b", re.IGNORECASE)
+        label_found = False
+        for scene in scenes:
+            text = scene["texto"] if isinstance(scene, dict) else scene
+            norm_text = _normalize_number_label(text.strip()[:30])
+            if label_pattern.match(norm_text):
+                label_found = True
+                break
+        if not label_found:
+            _safe_print(f"[SceneDivision] MISSING label: '{label}' (norm: '{norm_label}')")
+        if label_found:
+            continue
+
+        # Label is missing — find the text that follows it in the original
+        after_label = original_text[match.end():match.end() + 60].strip()
+        first_words = " ".join(after_label.split()[:5]).lower()
+        if not first_words:
+            continue
+
+        # Find which scene starts with (or contains) those words
+        for scene in scenes:
+            text = scene["texto"] if isinstance(scene, dict) else scene
+            scene_lower = text.strip().lower()
+            if scene_lower.startswith(first_words):
+                if isinstance(scene, dict):
+                    scene["texto"] = label + " " + scene["texto"]
+                _safe_print(f"[SceneDivision] Restored missing label: '{label}' to scene '{first_words[:40]}'")
+                repaired += 1
+                break
+
+    if repaired:
+        _safe_print(f"[SceneDivision] Restored {repaired} missing number labels")
+    return scenes
+
+
+_DIGIT_TO_WORD = {v: k for k, v in _WORD_TO_DIGIT.items()}  # "1" -> "one", "2" -> "two", etc.
+
+
+def _fix_title_separators(scenes: list, original_script: str) -> list:
+    """Insert missing title-end periods using the original script as reference.
+
+    Whisper SRT often strips the period after numbered entry titles, making
+    _force_split_numbered_titles unable to find where the title ends.
+
+    For each numbered scene, looks up the corresponding title in the original
+    script and inserts the missing period so the title can be split later.
+    """
+    if not original_script:
+        return scenes
+
+    fixed = 0
+    for scene in scenes:
+        text = scene["texto"] if isinstance(scene, dict) else scene
+        if not _is_numbered_entry(text):
+            continue
+
+        # Already has a detectable title end — skip
+        if _find_title_end(text) is not None:
+            continue
+
+        # Extract the number from the scene (e.g., "Number 1." → "1")
+        num_m = re.match(
+            rf"^\s*(?:Number\s+(?:(\d+)|({_WORD_NUMBERS})))",
+            text, re.IGNORECASE,
+        )
+        if not num_m:
+            continue
+        digit = num_m.group(1) or _WORD_TO_DIGIT.get(num_m.group(2).lower(), "")
+        if not digit:
+            continue
+
+        # Find this number in the original script (try both word and digit forms)
+        word_form = _DIGIT_TO_WORD.get(digit, "")
+        patterns_to_try = [
+            rf"Number\s+{re.escape(digit)}\s*[,:.]\s*",
+            rf"Number\s+{re.escape(word_form)}\s*[,:.]\s*" if word_form else None,
+        ]
+        script_match = None
+        for pat in patterns_to_try:
+            if pat is None:
+                continue
+            m = re.search(pat, original_script, re.IGNORECASE)
+            if m:
+                script_match = m
+                break
+        if not script_match:
+            continue
+
+        # Extract the title from the original script: text until ". " followed by uppercase
+        after_label = original_script[script_match.end():]
+        title_end_m = re.search(r"\.\s+[A-Z]", after_label)
+        if not title_end_m:
+            continue
+
+        # Get last 3 words of the original title (lowercased) for fuzzy matching
+        original_title_words = after_label[:title_end_m.start()].strip().split()
+        if len(original_title_words) < 2:
+            continue
+        tail_words = [w.lower().rstrip(".,;:!?") for w in original_title_words[-3:]]
+        tail_pattern = r"\s+".join(re.escape(w) for w in tail_words)
+
+        # Find those tail words in the scene text and insert period after them
+        scene_text = scene["texto"] if isinstance(scene, dict) else scene
+        tail_m = re.search(tail_pattern, scene_text, re.IGNORECASE)
+        if not tail_m:
+            continue
+
+        insert_pos = tail_m.end()
+        # Don't insert if remaining text is just punctuation (scene is title-only)
+        remaining = scene_text[insert_pos:].strip()
+        if not remaining or len(remaining.strip('.,;:!?"\'')) < 3:
+            continue
+        # Only insert if there's no period already at that position
+        if insert_pos < len(scene_text) and scene_text[insert_pos:insert_pos + 2] not in (". ", ".\n"):
+            new_text = scene_text[:insert_pos] + "." + scene_text[insert_pos:]
+            if isinstance(scene, dict):
+                scene["texto"] = new_text
+            fixed += 1
+
+    if fixed:
+        _safe_print(f"[SceneDivision] Fixed {fixed} missing title separators from original script")
+    return scenes
+
+
 def divide_script_into_scenes(_script_text: str, srt_content: str, mode: str = "animated") -> list:
     """Divide a script into scenes using Claude Haiku + word-level SRT timestamps.
 
@@ -516,6 +681,17 @@ def divide_script_into_scenes(_script_text: str, srt_content: str, mode: str = "
 
     # ── Final repair: fix numbered entries split across SRT blocks ─────
     all_scenes = _repair_numbered_scenes(all_scenes)
+
+    # ── Restore any "Number X." labels Sonnet dropped ─────
+    # Use original script (has all labels) instead of Whisper SRT (may miss some)
+    ref_text = _script_text if _script_text else full_text
+    all_scenes = _restore_missing_number_labels(all_scenes, ref_text)
+
+    # ── Fix title separators using original script ─────
+    all_scenes = _fix_title_separators(all_scenes, _script_text if _script_text else "")
+
+    # ── Second pass: split titles that now have periods inserted ─────
+    all_scenes = _force_split_numbered_titles_with_ts(all_scenes)
 
     # Renumber IDs sequentially
     for idx, s in enumerate(all_scenes, 1):
@@ -594,32 +770,22 @@ def _repair_numbered_scenes(scenes: list) -> list:
     if repairs > 0:
         _safe_print(f"[SceneDivision] Repaired {repairs} split numbered entries")
 
-    # After repair merges, force-split titles from explanations again
-    # E.g. repair merged "Number 5, The Train" + "Goes Off. Details..." into
-    # "Number 5, The Train Goes Off. Details..." → split into title + detail scenes
-    final = []
+    # Post-repair split: if a numbered entry's title part has >6 words, split it
+    split_result = []
     for scene in result:
-        txt = scene["texto"]
-        if _is_numbered_entry(txt):
-            title_end = _find_title_end(txt)
+        text = scene["texto"]
+        if _is_numbered_entry(text):
+            title_end = _find_title_end(text)
             if title_end is not None:
-                title = txt[:title_end].strip()
-                detail = txt[title_end:].strip()
-                if detail:
-                    total_ms = scene["endMs"] - scene["startMs"]
-                    total_words = len(txt.split())
-                    title_words = len(title.split())
-                    # Proportional time split based on word count
-                    ratio = title_words / total_words if total_words > 0 else 0.3
-                    title_dur = int(total_ms * ratio)
-                    split_ms = scene["startMs"] + title_dur
-                    final.append({**scene, "texto": title, "endMs": split_ms})
-                    final.append({**scene, "texto": detail, "startMs": split_ms})
-                    _safe_print(f"[SceneDivision] Post-repair split: '{title[:50]}' | '{detail[:50]}'")
+                title = text[:title_end].strip()
+                detail = text[title_end:].strip()
+                if detail and len(title.split()) > 5:
+                    mid_ms = (scene["startMs"] + scene["endMs"]) // 2
+                    split_result.append({**scene, "texto": title, "endMs": mid_ms})
+                    split_result.append({**scene, "texto": detail, "startMs": mid_ms})
                     continue
-        final.append(scene)
-
-    return final
+        split_result.append(scene)
+    return split_result
 
 
 def _parse_srt_entries_full(srt_text: str) -> list:
@@ -714,13 +880,17 @@ def _divide_text_with_haiku(full_text: str, total_duration_s: float, wps: float,
             "Step 3: For each section between hard cuts, divide into 4-7 second visual chunks.\n"
             "Step 4: Verify every scene has a clear visual identity — if you can't picture a stock clip for it, the cut is wrong.\n\n"
             "=== CRITICAL RULE FOR NUMBERED LISTS/COUNTDOWN ===\n"
-            "If the script contains list numbers (Number 1, Number 2, Fact #10, #9, etc.):\n"
-            "- EVERY NUMBER + TITLE must be its OWN SEPARATE SCENE, without the explanation.\n"
-            "- The title ends at the first '.' or ':' after the number phrase.\n"
-            "- The explanation/detail that follows goes in the NEXT scene(s).\n"
-            "- CORRECT: Scene 1 = 'Number 3, The Brazilian Setting That Was Never Brazil.' | Scene 2 = 'The actual filming took place in...'\n"
-            "- WRONG: Scene 1 = 'Number 3, The Brazilian Setting That Was Never Brazil. The actual filming took place in...'\n"
-            "- After the title scene, divide the explanation into 4-7 second scenes normally.\n\n"
+            "If the script contains list numbers (Number 1, Number 2, Number one, Number two, Fact #10, #9, etc.):\n"
+            "- The NUMBER + TITLE + FIRST SENTENCE of the explanation must be ONE SINGLE SCENE.\n"
+            "- NEVER create a scene with ONLY the number (e.g. 'Number 10.' alone is WRONG).\n"
+            "- NEVER remove or omit the number label. If the script says 'Number two.' it MUST appear as 'Number two.' in the output.\n"
+            "- NEVER split the number from its title or first sentence.\n"
+            "- The numbered scene should include enough content to fill 4-7 seconds.\n"
+            "- After the first sentence, divide the remaining explanation into 4-7 second scenes normally.\n"
+            "- CORRECT: Scene 1 = 'Number 10. The film's iconic soundtrack features over 60 songs' | Scene 2 = 'from the 1960s, 70s, and 80s, carefully selected by Scorsese himself'\n"
+            "- CORRECT: Scene 1 = 'Number 4. The costume budget for Casino exceeded $3 million, making it one of the most expensive wardrobe productions in film history up to that point.'\n"
+            "- WRONG: Scene 1 = 'Number 10.' (too short, number alone) | Scene 2 = 'The film's iconic soundtrack...'\n"
+            "- WRONG: Scene 1 = 'Number 10. The film's' (incomplete idea)\n\n"
             "=== EXAMPLE ===\n"
             f"Speaking rate: {wps:.2f} words/sec → 4s ≈ {int(4*wps)} words, 7s ≈ {int(7*wps)} words\n\n"
             "Script: \"Fast Five, released in 2011, is arguably the most pivotal movie in the Fast and Furious franchise, "
@@ -809,6 +979,11 @@ def _divide_text_with_haiku(full_text: str, total_duration_s: float, wps: float,
     raw = resp.choices[0].message.content
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
+    # Extract only the JSON array (Sonnet sometimes adds text after the array)
+    bracket_start = raw.find("[")
+    bracket_end = raw.rfind("]")
+    if bracket_start != -1 and bracket_end != -1:
+        raw = raw[bracket_start:bracket_end + 1]
     scenes = json.loads(raw)
 
     if not isinstance(scenes, list) or not all(isinstance(s, str) for s in scenes):
@@ -817,12 +992,48 @@ def _divide_text_with_haiku(full_text: str, total_duration_s: float, wps: float,
     return scenes
 
 
+def _force_split_numbered_titles_with_ts(scenes: list) -> list:
+    """Like _force_split_numbered_titles but for scene dicts with timestamps.
+
+    Used after _fix_title_separators inserts missing periods — the original
+    _force_split_numbered_titles already ran (on plain strings) before the
+    period was available, so this second pass catches newly-splittable titles.
+    """
+    result = []
+    for scene in scenes:
+        text = scene["texto"]
+        if _is_numbered_entry(text):
+            title_end = _find_title_end(text)
+            if title_end is not None:
+                title = text[:title_end].strip()
+                detail = text[title_end:].strip()
+                # Detail must be meaningful (not just punctuation)
+                detail_clean = detail.strip('.,;:!?"\'() ')
+                if detail_clean and len(detail_clean.split()) >= 3 and len(title.split()) > 5:
+                    total_words = len(text.split())
+                    title_words = len(title.split())
+                    ratio = title_words / total_words if total_words > 0 else 0.5
+                    start = scene["startMs"]
+                    end = scene["endMs"]
+                    mid = int(start + (end - start) * ratio)
+                    _safe_print(f"[PostProc] Split numbered title (ts): '{title[:50]}' | '{detail[:50]}'")
+                    result.append({"id": 0, "texto": title, "startMs": start, "endMs": mid})
+                    result.append({"id": 0, "texto": detail, "startMs": mid, "endMs": end})
+                    continue
+        result.append(scene)
+    return result
+
+
 def _force_split_numbered_titles(scene_texts: list) -> list:
     """Force-split any numbered entry where title + explanation are in the same scene.
 
-    E.g. "Number 1: The Boulder Was Real. The opening temple..." becomes:
-      - "Number 1: The Boulder Was Real."
-      - "The opening temple..."
+    GUARD: Only split if the title part has >5 words to avoid creating
+    ultra-short scenes like "Number 10." (2 words).
+
+    E.g. "Number 2. Rambo in Beverly Hills. The script was action-heavy..." (6-word title)
+      → splits into title + detail
+    But "Number 10. The soundtrack." (4-word title)
+      → stays together (title too short to stand alone)
     """
     result = []
     for text in scene_texts:
@@ -831,7 +1042,7 @@ def _force_split_numbered_titles(scene_texts: list) -> list:
             if title_end is not None:
                 title = text[:title_end].strip()
                 detail = text[title_end:].strip()
-                if detail:
+                if detail and len(title.split()) > 5:
                     _safe_print(f"[PostProc] Split numbered title: '{title[:50]}' | detail: '{detail[:50]}'")
                     result.append(title)
                     result.append(detail)
@@ -847,7 +1058,7 @@ def _postprocess_scenes(scene_texts: list, wps: float, mode: str = "animated") -
     Numbered entries (Number X, #X) get a relaxed max duration to avoid bad splits.
     """
     MAX_DUR = 7.0 if mode == "stock" else 6.0
-    NUMBERED_MAX_DUR = 12.0 if mode == "stock" else 12.0
+    NUMBERED_MAX_DUR = 15.0 if mode == "stock" else 12.0
     min_words = 4
 
     def _effective_max(text):
@@ -855,7 +1066,6 @@ def _postprocess_scenes(scene_texts: list, wps: float, mode: str = "animated") -
 
     scenes = list(scene_texts)
 
-    # Force-split numbered titles BEFORE merge/split cycles
     scenes = _force_split_numbered_titles(scenes)
 
     # Run up to 10 full cycles of merge+split until everything is clean
@@ -914,7 +1124,7 @@ def _merge_short_scenes(scenes: list, min_words: int) -> list:
                 # Check this FIRST because _is_numbered_entry won't match bare
                 # numbers (it requires trailing content with a space).
                 bare_m = re.match(
-                    r"^\s*(?:Number\s+\d+|#\s*\d+|\d{1,2})\s*[,:.]\s*$",
+                    rf"^\s*(?:Number\s+(?:\d+|{_WORD_NUMBERS})|#\s*\d+|\d{{1,2}})\s*[,:.]\s*$",
                     text,
                     re.IGNORECASE,
                 )
@@ -923,9 +1133,14 @@ def _merge_short_scenes(scenes: list, min_words: int) -> list:
                     changed = True
                     i += 1
                     continue
-                # Numbered entries with a title (e.g. "Number 5. The Title.")
-                # are intentionally short — keep them.
+                # Numbered entries: if still too short, merge forward
                 if _is_numbered_entry(text):
+                    if i + 1 < len(scenes) and not _is_numbered_entry(scenes[i + 1]):
+                        scenes[i + 1] = text.rstrip() + " " + scenes[i + 1].lstrip()
+                        changed = True
+                        i += 1
+                        continue
+                    # Can't merge forward — keep as-is
                     result.append(text)
                     i += 1
                     continue

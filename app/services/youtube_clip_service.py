@@ -1194,6 +1194,10 @@ Return ONLY a JSON object:
             temp_file = temp_dir / f"yt_{chosen['id']}.mp4"
             video_url = f"https://www.youtube.com/watch?v={chosen['id']}"
 
+            # Register YouTube ID early to prevent other threads from downloading same video
+            if used_urls is not None and chosen.get("id"):
+                used_urls.add(chosen["id"])
+
             if not _download_youtube_video(video_url, temp_file):
                 _safe_print(f"[YTClip] Download failed for {chosen['id']}, trying next...")
                 continue
@@ -1296,6 +1300,7 @@ Return ONLY a JSON object:
                 "local_path": str(dest_path),
                 "youtube_id": chosen["id"],
                 "youtube_title": chosen["title"],
+                "origin_url": video_url,
             }
 
     _safe_print(f"[YTClip] No clip found after all attempts")

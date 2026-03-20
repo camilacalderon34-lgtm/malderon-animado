@@ -1364,7 +1364,7 @@ def _process_one_scene(
                         analysis=broader_analysis,
                         project_dir=project_dir,
                         collection=collection,
-                        used_videos=set(),
+                        used_videos=used_videos,
                         scene_text=chunk.scene_text or "",
                         project_title=project_title,
                     )
@@ -1397,14 +1397,27 @@ def _process_one_scene(
                      f"🔄 [{idx}/{total}] Escena {chunk.chunk_number}: clip_bank reintentando con queries más amplios…",
                      stage="stock_search")
                 title_short = (project_title or "").split(":")[0].strip()[:40]
-                scene_words = (chunk.scene_text or "")[:100].strip()
-                fallback_kw = (chunk.search_keywords or "").split("|")
-                cb_retry_queries = [
-                    (scene_words, fallback_kw[0] if fallback_kw else ""),
-                    (f"{title_short} {scene_words[:30]}", f"{title_short} movie scene"),
-                    (f"{title_short} behind the scenes", f"{title_short} film footage"),
-                    (f"{title_short} movie clip", "action movie scene"),
-                ]
+                is_verify_round = (analysis or {}).get("_retry_round", 0) > 0
+
+                if is_verify_round:
+                    # Verification round: generic movie queries (specific ones already failed)
+                    cb_retry_queries = [
+                        (f"{title_short} scene", f"{title_short} film"),
+                        (f"{title_short} footage", f"{title_short} HD scene"),
+                        (f"{title_short} clip compilation", f"{title_short} best moments"),
+                        (f"{title_short} movie", f"{title_short} cinema"),
+                    ]
+                    _safe_print(f"[StockSearch] Scene {chunk.chunk_number}: using GENERIC movie queries (verify round)")
+                else:
+                    # First search: scene-specific queries
+                    scene_words = (chunk.scene_text or "")[:100].strip()
+                    fallback_kw = (chunk.search_keywords or "").split("|")
+                    cb_retry_queries = [
+                        (scene_words, fallback_kw[0] if fallback_kw else ""),
+                        (f"{title_short} {scene_words[:30]}", f"{title_short} movie scene"),
+                        (f"{title_short} behind the scenes", f"{title_short} film footage"),
+                        (f"{title_short} movie clip", "action movie scene"),
+                    ]
                 cb_found = False
                 for cb_attempt, (cbq, cbqa) in enumerate(cb_retry_queries, 1):
                     try:
@@ -1488,7 +1501,7 @@ def _process_one_scene(
                             analysis=fb_analysis,
                             project_dir=project_dir,
                             collection=collection,
-                            used_videos=set(),
+                            used_videos=used_videos,
                             scene_text=chunk.scene_text or "",
                             project_title=project_title,
                         )
@@ -1738,7 +1751,9 @@ def _run_stock_asset_search(project_id: int) -> None:
             db.close()
 
         # ── Final verification: retry all scenes without a valid clip ──────
-        _run_final_verification(project_id, project_dir, _collection, project_title, used_videos, used_videos_lock)
+        _run_final_verification(project_id, project_dir, _collection, _project_title,
+                                used_videos, used_videos_lock,
+                                poll_key=poll_key, script_context=_full_script_context)
 
     except Exception as exc:
         # Always use a fresh session for error handling — the original db may be closed
@@ -1765,6 +1780,8 @@ def _run_final_verification(
     project_title: str,
     used_videos: set,
     used_videos_lock: threading.Lock,
+    poll_key: str = "",
+    script_context: str = "",
 ) -> None:
     """Retry all scenes that ended in error/pending (no clip) up to 3 rounds."""
     MAX_ROUNDS = 3
@@ -1825,12 +1842,12 @@ def _run_final_verification(
         with ThreadPoolExecutor(max_workers=10) as pool:
             futures = {}
             for idx, (chunk_id, chunk_number) in enumerate(missing_ids, 1):
-                # Build a generic analysis to force re-search
+                # Pass retry round so clip_bank uses generic movie queries
                 future = pool.submit(
                     _process_one_scene,
                     project_id=project_id,
                     chunk_id=chunk_id,
-                    analysis=None,
+                    analysis={"_retry_round": round_num},
                     project_dir=project_dir,
                     collection=collection,
                     used_videos_lock=used_videos_lock,
@@ -1838,9 +1855,9 @@ def _run_final_verification(
                     found_counter=found_counter,
                     total=total_missing,
                     idx=idx,
-                    poll_key="stock_search",
+                    poll_key=poll_key,
                     project_title=project_title,
-                    script_context=_full_script_context if '_full_script_context' in dir() else "",
+                    script_context=script_context,
                 )
                 futures[future] = chunk_number
 
@@ -2641,8 +2658,24 @@ def _run_retry_chunk_image(project_id: int, chunk_number: int) -> None:
 
             project_dir = PROJECTS_PATH / project.slug
 
-            # Build script context for editorial AI decisions
+            # Build used_videos set from existing assets to prevent duplicates
             _all_chunks = db.query(Chunk).filter(Chunk.project_id == project_id).order_by(Chunk.chunk_number).all()
+            used_videos: set = set()
+            for _c in _all_chunks:
+                if _c.chunk_number == chunk_number:
+                    continue  # Skip the chunk being retried
+                if _c.video_path:
+                    used_videos.add(Path(_c.video_path).stem)
+                if _c.image_path:
+                    used_videos.add(Path(_c.image_path).stem)
+                if _c.rejected_sources:
+                    try:
+                        for rs in _json.loads(_c.rejected_sources):
+                            used_videos.add(rs)
+                    except Exception:
+                        pass
+
+            # Build script context for editorial AI decisions
             _retry_script_lines = [
                 f"Scene {c.chunk_number} [{c.asset_type or '?'}]: {(c.scene_text or '')[:120]}"
                 for c in _all_chunks[:50]
@@ -2683,7 +2716,7 @@ def _run_retry_chunk_image(project_id: int, chunk_number: int) -> None:
                             analysis=bg_analysis,
                             project_dir=project_dir,
                             collection=project.collection or "general",
-                            used_videos=set(),
+                            used_videos=used_videos,
                             scene_text=chunk.scene_text or "",
                             project_title=project.title or "",
                         )
@@ -2947,7 +2980,7 @@ def _run_retry_chunk_image(project_id: int, chunk_number: int) -> None:
                                 analysis=broader_analysis,
                                 project_dir=project_dir,
                                 collection=project.collection or "general",
-                                used_videos=set(),
+                                used_videos=used_videos,
                                 scene_text=chunk.scene_text or "",
                                 project_title=project.title or "",
                             )
@@ -3103,7 +3136,7 @@ def _run_retry_chunk_image(project_id: int, chunk_number: int) -> None:
                                 analysis=fb_analysis,
                                 project_dir=project_dir,
                                 collection=project.collection or "general",
-                                used_videos=set(),
+                                used_videos=used_videos,
                                 scene_text=chunk.scene_text or "",
                                 project_title=project.title or "",
                             )
