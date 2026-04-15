@@ -604,8 +604,17 @@ _pipeline_path = ROOT / "app" / "services" / "pipeline_service.py"
 _pipeline_src = _pipeline_path.read_text(encoding="utf-8")
 _tree = _ast.parse(_pipeline_src)
 
+# Stock phase functions may be in pipeline_service.py or pipeline/stock_phase.py
+_stock_phase_path = ROOT / "app" / "services" / "pipeline" / "stock_phase.py"
+if _stock_phase_path.exists():
+    _stock_src = _stock_phase_path.read_text(encoding="utf-8")
+    _stock_tree = _ast.parse(_stock_src)
+else:
+    _stock_src = _pipeline_src
+    _stock_tree = _tree
+
 # --- Test 30: _run_stock_asset_search uses _project_title not project_title ---
-for _node in _ast.walk(_tree):
+for _node in _ast.walk(_stock_tree):
     if isinstance(_node, _ast.FunctionDef) and _node.name == "_run_stock_asset_search":
         _names_used = set()
         for _child in _ast.walk(_node):
@@ -619,9 +628,9 @@ for _node in _ast.walk(_tree):
         break
 
 # --- Test 31: _run_final_verification has no dir() hack ---
-for _node in _ast.walk(_tree):
+for _node in _ast.walk(_stock_tree):
     if isinstance(_node, _ast.FunctionDef) and _node.name == "_run_final_verification":
-        _src_lines = _pipeline_src.split("\n")[_node.lineno - 1 : _node.end_lineno]
+        _src_lines = _stock_src.split("\n")[_node.lineno - 1 : _node.end_lineno]
         _src_text = "\n".join(_src_lines)
         check(
             "31a. _run_final_verification has no dir() hack",

@@ -3,9 +3,9 @@ Pipeline package — modular orchestrator for video generation.
 
 This package splits the monolithic pipeline_service.py into focused modules:
   - helpers: shared utilities (DB, logging, paths, audio)
-  - (future) script_phase: Phase 1 script generation
-  - (future) scene_phase: Phase 2 SRT + scene division
-  - (future) stock_phase: Stock asset search
+  - script_phase: Phase 1 script generation
+  - scene_phase: Phase 2 SRT + scene division + scene planning
+  - stock_phase: Stock asset search + verification
   - (future) video_phase: Video generation + rendering
 
 All public symbols are re-exported here for backward compatibility.
