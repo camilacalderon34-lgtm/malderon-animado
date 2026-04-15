@@ -12,6 +12,8 @@ from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Qu
 from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
 
+from sqlalchemy import func, case
+
 from ..database import get_db
 from ..models import Project, Chunk, ProjectStatus, AppSetting
 from ..schemas import ProjectCreate, ProjectOut, ProjectListItem, ScriptApprovalPayload, ResplitPayload, VoiceConfigPayload
@@ -55,33 +57,38 @@ def _resolve_tts_api_key(provided: str, db: Session) -> str:
 
 @router.get("/", response_model=List[ProjectListItem])
 def list_projects(db: Session = Depends(get_db)):
-    projects = (
-        db.query(Project)
+    # Single query with LEFT JOIN aggregation — avoids N+1 (was 2N+1 queries)
+    chunk_stats = (
+        db.query(
+            Chunk.project_id,
+            func.count(Chunk.id).label("chunk_count"),
+            func.sum(case((Chunk.status == "done", 1), else_=0)).label("chunks_done"),
+        )
+        .group_by(Chunk.project_id)
+        .subquery()
+    )
+
+    rows = (
+        db.query(Project, chunk_stats.c.chunk_count, chunk_stats.c.chunks_done)
+        .outerjoin(chunk_stats, Project.id == chunk_stats.c.project_id)
         .order_by(Project.created_at.desc())
         .all()
     )
-    result = []
-    for p in projects:
-        total = db.query(Chunk).filter(Chunk.project_id == p.id).count()
-        done = (
-            db.query(Chunk)
-            .filter(Chunk.project_id == p.id, Chunk.status == "done")
-            .count()
+
+    return [
+        ProjectListItem(
+            id=p.id,
+            title=p.title,
+            slug=p.slug,
+            mode=p.mode,
+            status=p.status,
+            created_at=p.created_at,
+            updated_at=p.updated_at,
+            chunk_count=total or 0,
+            chunks_done=done or 0,
         )
-        result.append(
-            ProjectListItem(
-                id=p.id,
-                title=p.title,
-                slug=p.slug,
-                mode=p.mode,
-                status=p.status,
-                created_at=p.created_at,
-                updated_at=p.updated_at,
-                chunk_count=total,
-                chunks_done=done,
-            )
-        )
-    return result
+        for p, total, done in rows
+    ]
 
 
 @router.post("/", response_model=ProjectOut, status_code=status.HTTP_201_CREATED)

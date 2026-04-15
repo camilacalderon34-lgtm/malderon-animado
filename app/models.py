@@ -26,6 +26,35 @@ class ProjectStatus(str, enum.Enum):
     error = "error"
 
 
+# Valid state transitions: {current_status: {allowed_next_statuses}}
+# "error" is always allowed from any state (not listed explicitly).
+VALID_TRANSITIONS: dict[ProjectStatus, set[ProjectStatus]] = {
+    ProjectStatus.queued:                  {ProjectStatus.processing},
+    ProjectStatus.processing:              {ProjectStatus.awaiting_approval, ProjectStatus.awaiting_voice_config},
+    ProjectStatus.awaiting_approval:       {ProjectStatus.processing, ProjectStatus.awaiting_voice_config},
+    ProjectStatus.awaiting_voice_config:   {ProjectStatus.awaiting_audio_approval, ProjectStatus.processing},
+    ProjectStatus.awaiting_audio_approval: {ProjectStatus.audio_approved, ProjectStatus.awaiting_voice_config},
+    ProjectStatus.audio_approved:          {ProjectStatus.scenes_ready, ProjectStatus.processing},
+    ProjectStatus.scenes_ready:            {ProjectStatus.generating_images},
+    ProjectStatus.generating_images:       {ProjectStatus.images_ready},
+    ProjectStatus.images_ready:            {ProjectStatus.animating, ProjectStatus.generating_videos, ProjectStatus.rendering, ProjectStatus.generating_images},
+    ProjectStatus.animating:               {ProjectStatus.videos_ready, ProjectStatus.images_ready},
+    ProjectStatus.generating_videos:       {ProjectStatus.videos_ready, ProjectStatus.images_ready},
+    ProjectStatus.videos_ready:            {ProjectStatus.rendering, ProjectStatus.generating_videos, ProjectStatus.animating},
+    ProjectStatus.rendering:               {ProjectStatus.done},
+    ProjectStatus.done:                    {ProjectStatus.queued, ProjectStatus.processing, ProjectStatus.rendering},
+    ProjectStatus.error:                   {s for s in ProjectStatus},  # can retry from error to any state
+}
+
+
+def check_transition(current: ProjectStatus, target: ProjectStatus) -> bool:
+    """Return True if the transition is valid. Error is always a valid target."""
+    if target == ProjectStatus.error:
+        return True
+    allowed = VALID_TRANSITIONS.get(current, set())
+    return target in allowed
+
+
 class ChunkStatus(str, enum.Enum):
     queued = "queued"
     pending = "pending"

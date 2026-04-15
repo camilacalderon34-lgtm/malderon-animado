@@ -124,9 +124,15 @@ def _update_project(db: Session, project: Project, **kwargs):
 
 def _set_project_status(db: Session, project_id: int, status, error_message: str | None = None):
     """Thread-safe project status update — always re-queries to avoid DetachedInstanceError."""
+    from ...models import check_transition
     proj = db.query(Project).filter(Project.id == project_id).first()
     if not proj:
         return
+    if proj.status and not check_transition(proj.status, status):
+        _logger.warning(
+            "Suspicious status transition for project %d: %s -> %s",
+            project_id, proj.status, status,
+        )
     proj.status = status
     if error_message is not None:
         proj.error_message = error_message
