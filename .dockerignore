@@ -1,0 +1,43 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.mypy_cache
+*.egg-info
+
+# Environment
+.env
+.env.local
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# Generated project outputs (mount as volume instead)
+projects/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Node modules (will be installed inside the container)
+remotion/node_modules
+node_modules
+
+# Tests (not needed at runtime)
+tests/
+
+# Documentation
+*.md
+LICENSE
+
+# OS
+Thumbs.db
+.DS_Store

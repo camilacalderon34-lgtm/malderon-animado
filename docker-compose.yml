@@ -1,0 +1,27 @@
+version: "3.8"
+
+services:
+  app:
+    build: .
+    container_name: malderon-creator
+    ports:
+      - "8000:8000"
+    volumes:
+      # Persist generated projects (videos, images, audio)
+      - ./projects:/app/projects
+      # Persist SQLite database
+      - ./data:/app/data
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONIOENCODING=utf-8
+      - PROJECTS_DIR=/app/projects
+      - DATABASE_URL=sqlite:////app/data/videocreator.db
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/projects/"]
+      interval: 30s
+      timeout: 10s
+      start_period: 15s
+      retries: 3
