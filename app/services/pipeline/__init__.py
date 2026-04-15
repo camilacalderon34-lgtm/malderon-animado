@@ -6,7 +6,9 @@ This package splits the monolithic pipeline_service.py into focused modules:
   - script_phase: Phase 1 script generation
   - scene_phase: Phase 2 SRT + scene division + scene planning
   - stock_phase: Stock asset search + verification
-  - (future) video_phase: Video generation + rendering
+  - render_phase: Phase 3 video generation + NCA rendering + voiceover
+  - media_phase: Image generation, retry, regeneration
+  - video_phase: Motion prompts, animation, Veo/Grok, recalibration
 
 All public symbols are re-exported here for backward compatibility.
 """
