@@ -29,6 +29,12 @@ from .helpers import (
     _render_web_image_animation, _render_fullscreen_image,
     _generate_short_title, _SimpleProject,
 )
+from ...constants import (
+    ASSET_CLIP_BANK, ASSET_TITLE_CARD, ASSET_WEB_IMAGE, ASSET_WEB_IMAGE_FULL,
+    ASSET_AI_IMAGE, ASSET_STOCK_VIDEO, ASSET_ARCHIVE_FOOTAGE, ASSET_SPACE_MEDIA,
+    CLIP_BANK_VALID_SOURCES, DEFAULT_COLLECTION,
+    WORKERS_STOCK_SEARCH, MIN_VIDEO_SIZE, MIN_IMAGE_SIZE,
+)
 
 
 # ── Entry point ─────────────────────────────────────────────────────────────
@@ -66,7 +72,7 @@ def _process_one_scene(
         # If analysis is None (verification pass), rebuild from chunk data
         if analysis is None:
             analysis = {
-                "asset_type": chunk.asset_type or "clip_bank",
+                "asset_type": chunk.asset_type or ASSET_CLIP_BANK,
                 "search_query": chunk.search_keywords.split("|")[0] if chunk.search_keywords else (chunk.scene_text or "")[:80],
                 "search_query_alt": chunk.search_keywords.split("|")[1] if chunk.search_keywords and "|" in chunk.search_keywords else "",
                 "overlay_text": chunk.overlay_text or "",
@@ -84,7 +90,7 @@ def _process_one_scene(
 
         # ── Title card: render with Remotion instead of searching ──
         scene_asset_type_pre = chunk.asset_type or analysis.get("asset_type", "")
-        if scene_asset_type_pre == "title_card":
+        if scene_asset_type_pre == ASSET_TITLE_CARD:
             _handle_title_card(
                 db, project_id, chunk, analysis, project_dir, collection,
                 used_videos, scene_duration, idx, total, project_title, poll_key,
@@ -145,12 +151,10 @@ def _process_one_scene(
 
         local_path = result.get("local_path")
         scene_type = chunk.asset_type or analysis.get("asset_type", "")
-        _CLIP_BANK_VALID_SOURCES = {"clip_bank", "youtube", "yt-dlp"}
-
         # clip_bank: ONLY accept real video from YouTube/clip_bank, reject everything else
-        if local_path and scene_type == "clip_bank":
+        if local_path and scene_type == ASSET_CLIP_BANK:
             src = result.get("asset_source", "")
-            if src not in _CLIP_BANK_VALID_SOURCES:
+            if src not in CLIP_BANK_VALID_SOURCES:
                 _safe_print(f"[StockSearch] Scene {chunk.chunk_number}: clip_bank rejecting source '{src}' (not real video)")
                 Path(local_path).unlink(missing_ok=True)
                 local_path = None
@@ -164,17 +168,17 @@ def _process_one_scene(
 
         # If no asset found, generate AI image IMMEDIATELY (never for clip_bank)
         cur_asset_type = chunk.asset_type or analysis.get("asset_type", "")
-        if not local_path and result.get("asset_type_found") == "ai_image" and cur_asset_type not in ("web_image", "clip_bank"):
+        if not local_path and result.get("asset_type_found") == ASSET_AI_IMAGE and cur_asset_type not in (ASSET_WEB_IMAGE, ASSET_CLIP_BANK):
             local_path = _generate_ai_image_fallback(
                 db, project_id, chunk, analysis, project_dir, project_title, poll_key, update_kwargs,
             )
 
         # For image-based types: render animation/zoom from the image
         scene_asset_type = chunk.asset_type or analysis.get("asset_type", "")
-        if (scene_asset_type in ("web_image", "web_image_full", "ai_image")
+        if (scene_asset_type in (ASSET_WEB_IMAGE, ASSET_WEB_IMAGE_FULL, ASSET_AI_IMAGE)
                 and local_path and not local_path.endswith(".mp4")
                 and "video_path" not in update_kwargs):
-            if scene_asset_type in ("web_image_full", "ai_image"):
+            if scene_asset_type in (ASSET_WEB_IMAGE_FULL, ASSET_AI_IMAGE):
                 vid_path = _render_fullscreen_image(local_path, chunk, project_dir)
             else:
                 vid_path = _render_web_image_animation(local_path, chunk, _SimpleProject(collection), project_dir)
@@ -252,7 +256,7 @@ def _handle_title_card(
          stage="stock_search")
     try:
         bg_analysis = dict(analysis)
-        bg_analysis["asset_type"] = "web_image"
+        bg_analysis["asset_type"] = ASSET_WEB_IMAGE
         orig_query = bg_analysis.get("search_query", "")
         orig_alt = bg_analysis.get("search_query_alt", "")
         if orig_alt:
@@ -289,7 +293,7 @@ def _handle_title_card(
         duration_seconds=tc_duration,
         background_image=bg_image_path,
     )
-    tc_kwargs = {"asset_type": "title_card", "overlay_text": overlay}
+    tc_kwargs = {"asset_type": ASSET_TITLE_CARD, "overlay_text": overlay}
     if bg_image_path:
         tc_kwargs["image_path"] = str(bg_image_path)
     if tc_success:
@@ -317,7 +321,7 @@ def _process_local_asset(local_path, chunk, scene_type, collection, project_dir,
             _clean_clip(Path(local_path))
         except Exception as exc:
             _safe_print(f"[StockSearch] Clean clip error (non-fatal): {exc}")
-        if Path(local_path).exists() and Path(local_path).stat().st_size > 5000:
+        if Path(local_path).exists() and Path(local_path).stat().st_size > MIN_VIDEO_SIZE:
             update_kwargs["video_path"] = local_path
         else:
             _safe_print(f"[StockSearch] Scene {chunk.chunk_number}: video file missing after clean! {local_path}")
@@ -325,15 +329,15 @@ def _process_local_asset(local_path, chunk, scene_type, collection, project_dir,
     else:
         # Image asset
         update_kwargs["image_path"] = local_path
-        if scene_type == "web_image":
+        if scene_type == ASSET_WEB_IMAGE:
             vid_path = _render_web_image_animation(local_path, chunk, _SimpleProject(collection), project_dir)
             if vid_path:
                 update_kwargs["video_path"] = vid_path
-        elif scene_type == "web_image_full":
+        elif scene_type == ASSET_WEB_IMAGE_FULL:
             vid_path = _render_fullscreen_image(local_path, chunk, project_dir)
             if vid_path:
                 update_kwargs["video_path"] = vid_path
-        elif scene_type in ("stock_video", "archive_footage", "space_media"):
+        elif scene_type in (ASSET_STOCK_VIDEO, ASSET_ARCHIVE_FOOTAGE, ASSET_SPACE_MEDIA):
             vid_path = _render_web_image_animation(local_path, chunk, _SimpleProject(collection), project_dir)
             if vid_path:
                 update_kwargs["video_path"] = vid_path
@@ -360,7 +364,7 @@ def _generate_ai_image_fallback(db, project_id, chunk, analysis, project_dir, pr
              f"Escena {chunk.chunk_number}: generando AI image... prompt='{prompt[:60]}'",
              stage="stock_search")
         _dispatch_generate_image(prompt, img_path, provider="pollinations", api_key=poll_key)
-        if img_path.exists() and img_path.stat().st_size > 1000:
+        if img_path.exists() and img_path.stat().st_size > MIN_IMAGE_SIZE:
             update_kwargs["image_path"] = str(img_path)
             update_kwargs["asset_source"] = "pollinations"
             _log(db, project_id,
@@ -387,10 +391,10 @@ def _handle_missing_asset(
     """Handle cases where the initial search found no asset — retry with different strategies."""
     local_path = None
 
-    if cur_asset_type == "ai_image":
+    if cur_asset_type == ASSET_AI_IMAGE:
         update_kwargs["status"] = ChunkStatus.error
         update_kwargs["error_message"] = "AI image generation failed"
-    elif scene_type in ("web_image", "web_image_full"):
+    elif scene_type in (ASSET_WEB_IMAGE, ASSET_WEB_IMAGE_FULL):
         _safe_print(f"[StockSearch] Scene {chunk.chunk_number}: web_image initial search failed, retrying...")
         web_retry_success = False
         broader_kw = (chunk.search_keywords or "").split("|")
@@ -418,7 +422,7 @@ def _handle_missing_asset(
                 if broader_local and not broader_local.endswith(".mp4"):
                     update_kwargs["image_path"] = broader_local
                     update_kwargs["asset_source"] = broader_result.get("asset_source", "web_search")
-                    if scene_type == "web_image_full":
+                    if scene_type == ASSET_WEB_IMAGE_FULL:
                         vid_path = _render_fullscreen_image(broader_local, chunk, project_dir)
                     else:
                         vid_path = _render_web_image_animation(broader_local, chunk, _SimpleProject(collection), project_dir)
@@ -435,7 +439,7 @@ def _handle_missing_asset(
             update_kwargs["error_message"] = "web_image: no se encontro imagen web tras multiples reintentos"
             _safe_print(f"[StockSearch] Scene {chunk.chunk_number}: web_image FAILED after all retries")
 
-    elif cur_asset_type == "clip_bank":
+    elif cur_asset_type == ASSET_CLIP_BANK:
         _handle_clip_bank_retry(
             db, project_id, chunk, analysis, project_dir, collection,
             used_videos, scene_duration, idx, total, project_title, update_kwargs,
@@ -483,7 +487,7 @@ def _handle_clip_bank_retry(
         try:
             _safe_print(f"[StockSearch] Scene {chunk.chunk_number}: clip_bank retry {cb_attempt}/4 q='{cbq[:50]}'")
             cb_analysis = {
-                "asset_type": "clip_bank",
+                "asset_type": ASSET_CLIP_BANK,
                 "search_query": cbq,
                 "search_query_alt": cbqa,
             }
@@ -504,9 +508,9 @@ def _handle_clip_bank_retry(
                     _clean_clip(Path(cb_local))
                 except Exception as exc:
                     _logger.warning("clean_clip failed for %s: %s", cb_local, exc)
-                if Path(cb_local).exists() and Path(cb_local).stat().st_size > 5000:
+                if Path(cb_local).exists() and Path(cb_local).stat().st_size > MIN_VIDEO_SIZE:
                     update_kwargs["video_path"] = cb_local
-                    update_kwargs["asset_source"] = cb_result.get("asset_source", "clip_bank")
+                    update_kwargs["asset_source"] = cb_result.get("asset_source", ASSET_CLIP_BANK)
                     update_kwargs["status"] = ChunkStatus.done
                     # Track in used_videos
                     with used_videos_lock:
@@ -556,7 +560,7 @@ def _handle_generic_fallback(
         try:
             _safe_print(f"[StockSearch] Scene {chunk.chunk_number}: web_image fallback {fb_attempt}/3 q='{fbq[:50]}'")
             fb_analysis = {
-                "asset_type": "web_image",
+                "asset_type": ASSET_WEB_IMAGE,
                 "search_query": fbq,
                 "search_query_alt": fbqa,
             }
@@ -608,7 +612,7 @@ def _run_stock_asset_search(project_id: int) -> None:
 
         # Extract ALL project attributes upfront -- avoids DetachedInstanceError after commits
         _slug = project.slug
-        _collection = project.collection or "general"
+        _collection = project.collection or DEFAULT_COLLECTION
         _project_title = project.title or ""
         _script_final = project.script_final or project.script or ""
         del project  # Prevent accidental use of detached ORM object
@@ -633,9 +637,9 @@ def _run_stock_asset_search(project_id: int) -> None:
         chunks_to_search = []
         for c in chunks:
             has_valid_asset = False
-            if c.video_path and Path(c.video_path).exists() and Path(c.video_path).stat().st_size > 5000:
+            if c.video_path and Path(c.video_path).exists() and Path(c.video_path).stat().st_size > MIN_VIDEO_SIZE:
                 has_valid_asset = True
-            elif c.image_path and Path(c.image_path).exists() and Path(c.image_path).stat().st_size > 1000:
+            elif c.image_path and Path(c.image_path).exists() and Path(c.image_path).stat().st_size > MIN_IMAGE_SIZE:
                 has_valid_asset = True
 
             if has_valid_asset and str(c.status) == "ChunkStatus.done":
@@ -748,7 +752,7 @@ def _run_stock_asset_search(project_id: int) -> None:
         for task_idx, chunk in enumerate(chunks_to_search, 1):
             a = analysis_map.get(chunk.chunk_number, {})
             if not a:
-                a = {"asset_type": "stock_video", "search_query": "nature landscape",
+                a = {"asset_type": ASSET_STOCK_VIDEO, "search_query": "nature landscape",
                      "search_query_alt": "aerial view"}
             scene_tasks.append((task_idx, chunk.id, chunk.chunk_number, a))
 
@@ -757,7 +761,7 @@ def _run_stock_asset_search(project_id: int) -> None:
              stage="stock_search")
         db.close()
 
-        with ThreadPoolExecutor(max_workers=10) as pool:
+        with ThreadPoolExecutor(max_workers=WORKERS_STOCK_SEARCH) as pool:
             futures = {}
             for task_idx, chunk_id, chunk_number, a in scene_tasks:
                 future = pool.submit(
@@ -878,7 +882,7 @@ def _run_final_verification(
         found_counter = [0]
         total_missing = len(missing_ids)
 
-        with ThreadPoolExecutor(max_workers=10) as pool:
+        with ThreadPoolExecutor(max_workers=WORKERS_STOCK_SEARCH) as pool:
             futures = {}
             for idx, (chunk_id, chunk_number) in enumerate(missing_ids, 1):
                 future = pool.submit(

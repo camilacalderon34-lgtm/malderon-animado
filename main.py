@@ -6,6 +6,7 @@ if sys.platform == "win32":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace", line_buffering=True)
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace", line_buffering=True)
 
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -20,11 +21,25 @@ from app.routers import youtube
 from app.routers import tts as tts_router
 from app.routers import settings as settings_router
 
+
+# ── Lifecycle (replaces deprecated @app.on_event) ───────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    init_db()
+    print("[OK] Database initialised")
+    print("[OK] YouTube Video Creator running at http://localhost:8000")
+    yield
+    # Shutdown
+    print("[OK] Shutting down gracefully")
+
+
 # ── App setup ─────────────────────────────────────────────────────────────────
 app = FastAPI(
     title="YouTube Video Creator",
     description="Automated YouTube video generation with AI",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -58,11 +73,3 @@ app.include_router(settings_router.router)
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
-
-
-# ── Startup ───────────────────────────────────────────────────────────────────
-@app.on_event("startup")
-def startup():
-    init_db()
-    print("[OK] Database initialised")
-    print("[OK] YouTube Video Creator running at http://localhost:8000")
