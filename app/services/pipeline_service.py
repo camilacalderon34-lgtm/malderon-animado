@@ -38,6 +38,9 @@ from . import pexels_service, pixabay_service, nca_service, google_service, wave
 from . import visual_analyzer_service, stock_search_service
 from .image import generate_image as _dispatch_generate_image
 from .video import motion_service, pollinations_video_service
+from ..logger import get_logger
+
+_logger = get_logger(__name__)
 
 MAX_WORKERS = settings.max_workers
 
@@ -85,12 +88,13 @@ def _get_reference_style(db, project) -> str | None:
 # ── Logging helpers ───────────────────────────────────────────────────────────
 
 def _safe_print(msg: str) -> None:
+    """Write a UTF-8 message to stdout. Falls back to logger on I/O errors."""
     import sys as _sys
     try:
         _sys.stdout.buffer.write((msg + "\n").encode("utf-8", errors="replace"))
         _sys.stdout.buffer.flush()
-    except Exception:
-        pass
+    except OSError:
+        _logger.debug("stdout write failed, message: %s", msg[:200])
 
 
 def _render_web_image_animation(image_path_str: str, chunk, project, project_dir: Path) -> str | None:
@@ -155,12 +159,7 @@ def _render_fullscreen_image(image_path_str: str, chunk, project_dir: Path) -> s
 
 def _log(db: Session, project_id: int, message: str, stage: str = "", level: str = "info"):
     from ..models import Log
-    import sys as _sys
-    try:
-        _sys.stdout.buffer.write(f"[{level.upper()}][{stage}] {message}\n".encode("utf-8", errors="replace"))
-        _sys.stdout.buffer.flush()
-    except Exception:
-        pass
+    _safe_print(f"[{level.upper()}][{stage}] {message}")
     try:
         # Only log if project still exists (guards against delete-while-running)
         if not db.query(Project).filter(Project.id == project_id).first():
@@ -174,8 +173,12 @@ def _log(db: Session, project_id: int, message: str, stage: str = "", level: str
         )
         db.add(entry)
         db.commit()
-    except Exception:
-        db.rollback()
+    except Exception as exc:
+        _logger.warning("Failed to persist log for project %d: %s", project_id, exc)
+        try:
+            db.rollback()
+        except Exception:
+            pass
 
 
 class _ProjectGoneError(RuntimeError):
@@ -193,7 +196,8 @@ def _update_project(db: Session, project: Project, **kwargs):
     except StaleDataError:
         db.rollback()
         raise _ProjectGoneError("Project was deleted while pipeline was running")
-    except Exception:
+    except Exception as exc:
+        _logger.error("Failed to update project: %s", exc)
         db.rollback()
         raise
 
@@ -208,6 +212,25 @@ def _set_project_status(db: Session, project_id: int, status, error_message: str
         proj.error_message = error_message
     proj.updated_at = datetime.utcnow()
     db.commit()
+
+
+def _safe_set_error(db: Session, project_id: int, error_message: str) -> None:
+    """Best-effort: mark a project as error. Logs if it fails instead of swallowing."""
+    try:
+        db.rollback()
+        db.expire_all()
+        proj = db.query(Project).filter(Project.id == project_id).first()
+        if proj:
+            proj.status = ProjectStatus.error
+            proj.error_message = error_message[:500]
+            proj.updated_at = datetime.utcnow()
+            db.commit()
+    except Exception as inner:
+        _logger.error("Failed to set error status for project %d: %s", project_id, inner)
+        try:
+            db.rollback()
+        except Exception:
+            pass
 
 
 def _update_chunk(db: Session, chunk: Chunk, **kwargs):
@@ -359,7 +382,8 @@ def _run_pipeline_phase1(project_id: int):
             if project.reference_transcripts:
                 try:
                     transcripts = _json.loads(project.reference_transcripts)
-                except Exception:
+                except (ValueError, TypeError) as exc:
+                    _logger.warning("Bad reference_transcripts JSON: %s", exc)
                     transcripts = []
 
             script_text = generate_script_full(
@@ -378,16 +402,9 @@ def _run_pipeline_phase1(project_id: int):
         _log(db, project_id, "Status set to awaiting_approval. Review and approve the script.", stage="approval")
 
     except _ProjectGoneError:
-        print(f"[INFO][pipeline] Project {project_id} was deleted mid-run, aborting.")
+        _logger.info("Project %d was deleted mid-run, aborting phase1.", project_id)
     except Exception as exc:
-        db.rollback()
-        db.expire_all()
-        project = db.query(Project).filter(Project.id == project_id).first()
-        if project:
-            try:
-                _update_project(db, project, status=ProjectStatus.error, error_message=str(exc))
-            except Exception:
-                pass
+        _safe_set_error(db, project_id, str(exc))
         _log(db, project_id, f"Pipeline phase1 error: {exc}\n{traceback.format_exc()}", stage="error", level="error")
     finally:
         db.close()
@@ -411,7 +428,8 @@ def _regenerate_script_thread(project_id: int):
         if project.reference_transcripts:
             try:
                 transcripts = _json.loads(project.reference_transcripts)
-            except Exception:
+            except (ValueError, TypeError) as exc:
+                _logger.warning("Bad reference_transcripts JSON: %s", exc)
                 transcripts = []
 
         script_text = generate_script_full(
@@ -429,16 +447,9 @@ def _regenerate_script_thread(project_id: int):
         _log(db, project_id, "Status set to awaiting_approval.", stage="approval")
 
     except _ProjectGoneError:
-        print(f"[INFO][pipeline] Project {project_id} was deleted mid-run, aborting.")
+        _logger.info("Project %d was deleted mid-run, aborting regenerate.", project_id)
     except Exception as exc:
-        db.rollback()
-        db.expire_all()
-        project = db.query(Project).filter(Project.id == project_id).first()
-        if project:
-            try:
-                _update_project(db, project, status=ProjectStatus.error, error_message=str(exc))
-            except Exception:
-                pass
+        _safe_set_error(db, project_id, str(exc))
         _log(db, project_id, f"Regenerate script error: {exc}\n{traceback.format_exc()}", stage="error", level="error")
     finally:
         db.close()
@@ -484,16 +495,9 @@ def _run_pipeline_phase2(project_id: int):
              stage="done")
 
     except _ProjectGoneError:
-        print(f"[INFO][pipeline] Project {project_id} was deleted mid-run, aborting.")
+        _logger.info("Project %d was deleted mid-run, aborting phase2.", project_id)
     except Exception as exc:
-        db.rollback()
-        db.expire_all()
-        project = db.query(Project).filter(Project.id == project_id).first()
-        if project:
-            try:
-                _update_project(db, project, status=ProjectStatus.error, error_message=str(exc))
-            except Exception:
-                pass
+        _safe_set_error(db, project_id, str(exc))
         _log(db, project_id, f"Pipeline phase2 error: {exc}\n{traceback.format_exc()}", stage="error", level="error")
     finally:
         db.close()
@@ -941,16 +945,10 @@ def _run_create_scenes_from_srt(project_id: int) -> None:
              stage="srt_scenes")
 
     except Exception as exc:
-        db.rollback()
-        try:
-            project = db.query(Project).filter(Project.id == project_id).first()
-            if project:
-                _update_project(db, project, status=ProjectStatus.error, error_message=str(exc))
-            _log(db, project_id,
-                 f"Error creando escenas: {exc}\n{traceback.format_exc()}",
-                 stage="srt_scenes", level="error")
-        except Exception as inner_exc:
-            print(f"[CRITICAL] Failed to log scene error for project {project_id}: {inner_exc}")
+        _safe_set_error(db, project_id, str(exc))
+        _log(db, project_id,
+             f"Error creando escenas: {exc}\n{traceback.format_exc()}",
+             stage="srt_scenes", level="error")
     finally:
         db.close()
 
@@ -1036,11 +1034,8 @@ def _run_plan_scenes(project_id: int, allowed_types: list | None = None,
              stage="plan_scenes")
 
     except Exception as exc:
-        _safe_print(f"[plan_scenes] Error: {exc}")
-        try:
-            _log(db, project_id, f"❌ Error planificando: {exc}", stage="plan_scenes", level="error")
-        except Exception:
-            pass
+        _logger.error("plan_scenes error for project %d: %s", project_id, exc)
+        _log(db, project_id, f"❌ Error planificando: {exc}", stage="plan_scenes", level="error")
     finally:
         db.close()
 
@@ -1231,8 +1226,8 @@ def _process_one_scene(
                             existing = set(_json.loads(chunk.rejected_sources))
                         existing.add(yt_id)
                         _update_chunk(db, chunk, rejected_sources=_json.dumps(list(existing)))
-                    except Exception:
-                        pass
+                    except (ValueError, TypeError) as exc:
+                        _logger.warning("Failed to persist yt_id for chunk %d: %s", chunk.id, exc)
                 if origin:
                     try:
                         existing = set()
@@ -1240,8 +1235,8 @@ def _process_one_scene(
                             existing = set(_json.loads(chunk.rejected_sources))
                         existing.add(origin)
                         _update_chunk(db, chunk, rejected_sources=_json.dumps(list(existing)))
-                    except Exception:
-                        pass
+                    except (ValueError, TypeError) as exc:
+                        _logger.warning("Failed to persist origin for chunk %d: %s", chunk.id, exc)
             break  # success, no duplicate
 
         # Update chunk in DB — preserve planned asset_type
@@ -1309,7 +1304,8 @@ def _process_one_scene(
                         visual_description=f"{search_hint}. Video title: {project_title}",
                     )
                     _safe_print(f"[AIImage] Scene {chunk.chunk_number}: generated prompt: {prompt[:100]}")
-                except Exception:
+                except Exception as exc:
+                    _logger.warning("[AIImage] Scene %d prompt generation failed (%s), using fallback", chunk.chunk_number, exc)
                     prompt = f"Cinematic photorealistic image of {search_hint}, dramatic lighting, 4K"
                 img_path = project_dir / "assets" / f"scene_{chunk.chunk_number}.jpg"
                 img_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1450,8 +1446,8 @@ def _process_one_scene(
                             try:
                                 from .youtube_clip_service import _clean_clip
                                 _clean_clip(Path(cb_local))
-                            except Exception:
-                                pass
+                            except Exception as exc:
+                                _logger.warning("clean_clip failed for %s: %s", cb_local, exc)
                             if Path(cb_local).exists() and Path(cb_local).stat().st_size > 5000:
                                 update_kwargs["video_path"] = cb_local
                                 update_kwargs["asset_source"] = cb_result.get("asset_source", "clip_bank")
@@ -1544,13 +1540,10 @@ def _process_one_scene(
              stage="stock_search")
 
     except Exception as exc:
-        _safe_print(f"[StockSearch] Scene thread error (chunk_id={chunk_id}): {exc}")
-        try:
-            _log(db, project_id,
-                 f"❌ Escena (chunk_id={chunk_id}): error en thread: {exc}",
-                 stage="stock_search", level="error")
-        except Exception:
-            pass
+        _logger.error("StockSearch thread error (chunk_id=%d): %s", chunk_id, exc, exc_info=True)
+        _log(db, project_id,
+             f"❌ Escena (chunk_id={chunk_id}): error en thread: {exc}",
+             stage="stock_search", level="error")
     finally:
         db.close()
 
@@ -1615,13 +1608,13 @@ def _run_stock_asset_search(project_id: int) -> None:
                 if old_path:
                     try:
                         Path(old_path).unlink(missing_ok=True)
-                    except Exception:
-                        pass
+                    except OSError as exc:
+                        _logger.debug("Could not delete old asset %s: %s", old_path, exc)
             for ext in (".jpg", ".mp4", ".png"):
                 try:
                     (assets_dir / f"scene_{c.chunk_number}{ext}").unlink(missing_ok=True)
-                except Exception:
-                    pass
+                except OSError as exc:
+                    _logger.debug("Could not delete scene_%d%s: %s", c.chunk_number, ext, exc)
             c.image_path = None
             c.video_path = None
             c.asset_source = None
@@ -1699,8 +1692,8 @@ def _run_stock_asset_search(project_id: int) -> None:
                 try:
                     for rs in _json.loads(c.rejected_sources):
                         used_videos.add(rs)
-                except Exception:
-                    pass
+                except (ValueError, TypeError) as exc:
+                    _logger.debug("Bad rejected_sources JSON for chunk %d: %s", c.id, exc)
         poll_key = _get_pollinations_api_key(db)
 
         # Build full script context so AI thinks like an editor who has read the entire script
@@ -1764,7 +1757,8 @@ def _run_stock_asset_search(project_id: int) -> None:
                                 poll_key=poll_key, script_context=_full_script_context)
 
     except Exception as exc:
-        # Always use a fresh session for error handling — the original db may be closed
+        _logger.error("Stock search error for project %d: %s", project_id, exc, exc_info=True)
+        # Use a fresh session — the original db may be closed or corrupt
         try:
             db.close()
         except Exception:
@@ -1775,8 +1769,8 @@ def _run_stock_asset_search(project_id: int) -> None:
             _log(db, project_id,
                  f"Error en búsqueda de assets: {exc}\n{traceback.format_exc()}",
                  stage="stock_search", level="error")
-        except Exception:
-            print(f"[CRITICAL] Failed to log stock search error for project {project_id}")
+        except Exception as inner:
+            _logger.critical("Failed to log stock search error for project %d: %s", project_id, inner)
         finally:
             db.close()
 
@@ -2129,16 +2123,10 @@ def _run_generate_images(project_id: int) -> None:
                  stage="media_done")
 
     except Exception as exc:
-        db.rollback()
-        try:
-            project = db.query(Project).filter(Project.id == project_id).first()
-            if project:
-                _update_project(db, project, status=ProjectStatus.error, error_message=str(exc))
-            _log(db, project_id,
-                 f"Error en generación masiva: {exc}\n{traceback.format_exc()}",
-                 stage="media_error", level="error")
-        except Exception:
-            pass
+        _safe_set_error(db, project_id, str(exc))
+        _log(db, project_id,
+             f"Error en generación masiva: {exc}\n{traceback.format_exc()}",
+             stage="media_error", level="error")
     finally:
         db.close()
 
@@ -2237,16 +2225,9 @@ def _run_pipeline_phase3(project_id: int):
             _log(db, project_id, "¡Todos los chunks procesados! Video listo.", stage="phase3_done")
 
     except _ProjectGoneError:
-        print(f"[INFO][phase3] Project {project_id} was deleted mid-run, aborting.")
+        _logger.info("Project %d was deleted mid-run, aborting phase3.", project_id)
     except Exception as exc:
-        db.rollback()
-        db.expire_all()
-        project = db.query(Project).filter(Project.id == project_id).first()
-        if project:
-            try:
-                _update_project(db, project, status=ProjectStatus.error, error_message=str(exc))
-            except Exception:
-                pass
+        _safe_set_error(db, project_id, str(exc))
         _log(db, project_id, f"Phase 3 error: {exc}\n{traceback.format_exc()}", stage="error", level="error")
     finally:
         db.close()
@@ -2486,16 +2467,9 @@ def _run_generate_voiceover(project_id: int):
              stage="tts_done")
 
     except _ProjectGoneError:
-        print(f"[INFO][tts] Project {project_id} was deleted mid-run, aborting.")
+        _logger.info("Project %d was deleted mid-run, aborting TTS.", project_id)
     except Exception as exc:
-        db.rollback()
-        db.expire_all()
-        project = db.query(Project).filter(Project.id == project_id).first()
-        if project:
-            try:
-                _update_project(db, project, status=ProjectStatus.error, error_message=str(exc))
-            except Exception:
-                pass
+        _safe_set_error(db, project_id, str(exc))
         _log(db, project_id, f"TTS pipeline error: {exc}\n{traceback.format_exc()}", stage="error", level="error")
     finally:
         db.close()
@@ -2581,8 +2555,8 @@ def _stock_branch(db, project_id, chunk, n, slug, narration, visual_desc, c_dir)
                 pexels_service.download_media(url, video_path)
                 downloaded = True
                 break
-        except Exception:
-            pass
+        except Exception as exc:
+            _logger.warning("[Chunk %d] Pexels search failed for '%s': %s", n, q, exc)
 
         if not downloaded:
             try:
@@ -2592,8 +2566,8 @@ def _stock_branch(db, project_id, chunk, n, slug, narration, visual_desc, c_dir)
                     pixabay_service.download_media(url, video_path)
                     downloaded = True
                     break
-            except Exception:
-                pass
+            except Exception as exc:
+                _logger.warning("[Chunk %d] Pixabay search failed for '%s': %s", n, q, exc)
 
     if not downloaded:
         # Last resort: download a photo and treat as a still video
