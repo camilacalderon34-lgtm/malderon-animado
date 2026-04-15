@@ -345,26 +345,33 @@ def _run_pipeline_phase1(project_id: int):
         _update_project(db, project, status=ProjectStatus.processing)
         _log(db, project_id, f"Pipeline started for '{project.title}'", stage="init")
 
-        # ── 1. Generate full script (outline is generated internally) ──────
-        _log(db, project_id, "Generating full script with Claude…", stage="script")
-        import json as _json
-        transcripts = []
-        if project.reference_transcripts:
-            try:
-                transcripts = _json.loads(project.reference_transcripts)
-            except Exception:
-                transcripts = []
-                
-        script_text = generate_script_full(
-            title=project.title,
-            transcripts=transcripts or None,
-            video_type=project.video_type or "top10",
-            duration=project.duration or "6-8"
-        )
+        # ── Check for custom script (user provided their own) ─────────────
+        if project.custom_script and project.custom_script.strip():
+            _log(db, project_id, "Using user-provided custom script (skipping AI generation).", stage="script")
+            script_text = clean_script(project.custom_script.strip())
+            _update_project(db, project, script=script_text)
+            _log(db, project_id, f"Custom script loaded ({len(script_text.split())} words). Awaiting approval.", stage="script")
+        else:
+            # ── 1. Generate full script (outline is generated internally) ──────
+            _log(db, project_id, "Generating full script with Claude…", stage="script")
+            import json as _json
+            transcripts = []
+            if project.reference_transcripts:
+                try:
+                    transcripts = _json.loads(project.reference_transcripts)
+                except Exception:
+                    transcripts = []
 
-        script_text = clean_script(script_text)
-        _update_project(db, project, script=script_text)
-        _log(db, project_id, "Script generated. Awaiting manual approval.", stage="script")
+            script_text = generate_script_full(
+                title=project.title,
+                transcripts=transcripts or None,
+                video_type=project.video_type or "top10",
+                duration=project.duration or "6-8"
+            )
+
+            script_text = clean_script(script_text)
+            _update_project(db, project, script=script_text)
+            _log(db, project_id, "Script generated. Awaiting manual approval.", stage="script")
 
         # ── 2. Pause — wait for user approval ─────────────────────────────
         _update_project(db, project, status=ProjectStatus.awaiting_approval)
@@ -864,7 +871,8 @@ def _run_create_scenes_from_srt(project_id: int) -> None:
              f"[SceneDivision] Sonnet (Anthropic) divide_script_into_scenes — modo={project_mode}",
              stage="srt_scenes")
 
-        scenes = divide_script_into_scenes(script_text, srt_content, mode=project_mode)
+        scenes = divide_script_into_scenes(script_text, srt_content, mode=project_mode,
+                                                  video_pipeline=project.video_pipeline or "default")
 
         _log(db, project_id,
              f"Claude dividio el script en {len(scenes)} escenas.",
@@ -2049,6 +2057,7 @@ def _run_generate_images(project_id: int) -> None:
                     scenes_data,
                     reference_character=project.reference_character or "",
                     full_script=project.script_final or "",
+                    visual_style=project.visual_style or "",
                 )
                 for c in chunks_needing_prompt:
                     if c.chunk_number in prompt_map:
@@ -3477,6 +3486,148 @@ def start_regenerate_all_genaipro(project_id: int) -> None:
     t.start()
 
 
+# ── Generate MISSING images only ─────────────────────────────────────────────
+
+def _run_generate_missing_images(project_id: int) -> None:
+    """Generate images ONLY for chunks that don't have an image yet.
+
+    Same logic as _run_regenerate_all_genaipro but filters to chunks
+    where image_path is NULL or the file doesn't exist on disk.
+    """
+    db = SessionLocal()
+    try:
+        project = db.query(Project).filter(Project.id == project_id).first()
+        if not project:
+            return
+
+        img_provider = _get_image_provider(db)
+        poll_key = _get_pollinations_api_key(db)
+        ws_key = _get_wavespeed_api_key(db)
+        ref_char = _get_reference_character(db, project)
+        ref_style = _get_reference_style(db, project)
+
+        chunks = (
+            db.query(Chunk)
+            .filter(Chunk.project_id == project_id)
+            .order_by(Chunk.chunk_number)
+            .all()
+        )
+
+        if not chunks:
+            _log(db, project_id, "No hay escenas en este proyecto.", stage="gen_missing", level="warning")
+            return
+
+        # Filter to chunks missing an image
+        missing: list[Chunk] = []
+        for chunk in chunks:
+            c_dir = chunk_dir(project.slug, chunk.chunk_number)
+            img_file = c_dir / "images" / f"image_{chunk.chunk_number}.jpg"
+            if not chunk.image_path or not img_file.exists():
+                missing.append(chunk)
+
+        if not missing:
+            _log(db, project_id, "✅ Todas las escenas ya tienen imagen — nada que generar.",
+                 stage="gen_missing")
+            return
+
+        total = len(missing)
+        _log(db, project_id,
+             f"⚡ Generando {total} imágenes faltantes con {img_provider.capitalize()} (paralelo)…",
+             stage="gen_missing")
+        _update_project(db, project, status=ProjectStatus.generating_images)
+
+        # Prepare tasks
+        tasks: list[dict] = []
+        skipped: list[str] = []
+        for chunk in missing:
+            n = chunk.chunk_number
+            img_prompt = (chunk.image_prompt or "").strip()
+            if not img_prompt:
+                img_prompt = (chunk.scene_text or "").strip()[:800]
+                if img_prompt:
+                    _log(db, project_id,
+                         f"[Missing {n}] ⚠️ Sin image_prompt — usando narración como fallback.",
+                         stage="gen_missing_progress", level="warning")
+            if not img_prompt:
+                msg = f"Escena #{n}: sin prompt y sin texto de escena — omitida."
+                skipped.append(msg)
+                _log(db, project_id, f"⚠️ {msg}", stage="gen_missing_progress", level="warning")
+                _update_chunk(db, chunk, status=ChunkStatus.error,
+                              error_message="Sin prompt visual — genera los prompts primero.")
+                continue
+
+            c_dir = chunk_dir(project.slug, n)
+            img_path = c_dir / "images" / f"image_{n}.jpg"
+            img_path.parent.mkdir(parents=True, exist_ok=True)
+            tasks.append({"chunk": chunk, "prompt": img_prompt, "path": img_path, "n": n})
+
+        # Generate in parallel (max 5 concurrent)
+        errors: list[str] = []
+
+        def _gen_one(task: dict) -> tuple[int, str | None]:
+            n = task["n"]
+            try:
+                print(f"[imagen_{n}] Generando faltante con {img_provider.capitalize()}...")
+                _dispatch_generate_image(
+                    task["prompt"], task["path"],
+                    provider=img_provider, api_key=poll_key, wavespeed_api_key=ws_key,
+                    reference_character_path=ref_char, reference_style_path=ref_style,
+                )
+                print(f"[imagen_{n}] Guardada: image_{n}.jpg")
+                return (n, None)
+            except Exception as exc:
+                return (n, str(exc))
+
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            futures = {pool.submit(_gen_one, t): t for t in tasks}
+            done_count = 0
+            for future in as_completed(futures):
+                done_count += 1
+                n, err = future.result()
+                task = futures[future]
+                chunk = task["chunk"]
+                if err:
+                    errors.append(f"Escena #{n}: {err}")
+                    _log(db, project_id, f"❌ Escena #{n}: {err}",
+                         stage="gen_missing_progress", level="error")
+                    _update_chunk(db, chunk, status=ChunkStatus.error, error_message=err)
+                else:
+                    rel = str(task["path"]).replace("\\", "/")
+                    _update_chunk(db, chunk, image_path=rel, status=ChunkStatus.done)
+                    _log(db, project_id,
+                         f"🖼️ [{done_count}/{total}] Escena #{n} generada.",
+                         stage="gen_missing_progress")
+
+        if errors:
+            _update_project(db, project, status=ProjectStatus.images_ready,
+                            error_message=f"{len(errors)} errores de {total}")
+            _log(db, project_id,
+                 f"⚠️ {total - len(errors)}/{total} imágenes faltantes generadas ({len(errors)} errores).",
+                 stage="gen_missing_done", level="error")
+        else:
+            _update_project(db, project, status=ProjectStatus.images_ready, error_message=None)
+            _log(db, project_id,
+                 f"✅ {total} imágenes faltantes generadas con {img_provider.capitalize()}.",
+                 stage="gen_missing_done")
+
+    except Exception as exc:
+        _log(db, project_id,
+             f"Error en generación de faltantes: {exc}\n{traceback.format_exc()}",
+             stage="gen_missing_error", level="error")
+    finally:
+        db.close()
+
+
+def start_generate_missing_images(project_id: int) -> None:
+    """Launch missing-image generation in a background daemon thread."""
+    t = threading.Thread(
+        target=_run_generate_missing_images,
+        args=(project_id,),
+        daemon=True,
+    )
+    t.start()
+
+
 # ── Phase 3.5: Generación de Motion Prompts ───────────────────────────────────
 
 def _run_generate_motion_prompts(project_id: int) -> None:
@@ -3571,10 +3722,10 @@ def _animate_one_scene(project_id: int, chunk_number: int, slug: str, api_key: s
 
 
 def _run_animate_scenes(project_id: int) -> None:
-    """Animate all scenes using Meta AI with 5 parallel browser workers."""
+    """Animate all scenes using Meta AI with 10 parallel browser workers."""
     from .video import meta_bot as _meta_bot
 
-    NUM_WORKERS = 5
+    NUM_WORKERS = 10
 
     db = SessionLocal()
     try:
@@ -3660,7 +3811,454 @@ def _run_animate_scenes(project_id: int) -> None:
 
 
 def start_animate_scenes(project_id: int) -> None:
-    t = threading.Thread(target=_run_animate_scenes, args=(project_id,), daemon=True)
+    """Launch animation in a separate Python process.
+
+    Playwright on Windows cannot spawn browser subprocesses from within
+    a uvicorn daemon thread (asyncio event loop conflict). Running as a
+    standalone subprocess avoids this entirely.
+    """
+    import subprocess as _sp
+    import sys as _sys
+    _sp.Popen(
+        [_sys.executable, "run_animate_project.py", str(project_id)],
+        cwd=str(Path(__file__).resolve().parent.parent.parent),
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Google Veo — direct text-to-video pipeline (no images needed)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _condense_visual_style(visual_style: str) -> str:
+    """Condense a long visual style description into a short suffix for Veo prompts.
+
+    Extracts the first sentence (setting/era) and key visual descriptors,
+    strips all "NO ..." negative instructions (generative models ignore negatives),
+    and returns a compact ~200 char string.
+    """
+    import re
+    style = (visual_style or "").strip()
+    if not style:
+        return ""
+
+    # Remove all "NO ..." clauses (they don't work in generative models)
+    style = re.sub(r",?\s*NO\s+[^,.]+", "", style, flags=re.IGNORECASE)
+
+    # Extract first sentence (usually the era/setting)
+    first_dot = style.find(".")
+    first_sentence = style[:first_dot].strip() if first_dot > 0 else style[:80]
+
+    # Extract key visual keywords from the rest
+    keywords = []
+    key_terms = [
+        "photorealistic", "cinematic", "oil-lamp glow", "limestone walls",
+        "packed earth", "reed mats", "clay oil lamps", "linen tunics",
+        "gritty and grounded", "communal warmth", "dust and smoke",
+        "sacred ordinariness", "sandals", "bare feet", "olive.*skin",
+        "dark hair", "weathered",
+    ]
+    rest = style[first_dot + 1:] if first_dot > 0 else ""
+    for term in key_terms:
+        if re.search(term, rest, re.IGNORECASE):
+            # Use the clean term (not regex)
+            clean = term.replace(".*", " to ")
+            keywords.append(clean)
+
+    suffix = first_sentence
+    if keywords:
+        suffix += ", " + ", ".join(keywords[:8])
+    suffix += "."
+
+    return suffix
+
+
+def _run_generate_videos_veo(project_id: int) -> None:
+    """Generate video clips directly from text prompts using Google Veo."""
+    from .video import veo_service
+
+    db = SessionLocal()
+    try:
+        project = db.query(Project).filter(Project.id == project_id).first()
+        if not project:
+            return
+
+        veo_key = _get_db_setting(db, "geminigen_api_key") or settings.geminigen_api_key
+        if not veo_key:
+            _update_project(db, project, status=ProjectStatus.error,
+                            error_message="GeminiGen.AI API key no configurada. Configúrala en Settings.")
+            return
+
+        _update_project(db, project, status=ProjectStatus.generating_videos)
+        _log(db, project_id, "Iniciando generación de videos con GeminiGen.AI Veo 3.1 Fast…", stage="veo")
+
+        chunks = (
+            db.query(Chunk)
+            .filter(Chunk.project_id == project_id, Chunk.status != ChunkStatus.done)
+            .order_by(Chunk.chunk_number)
+            .all()
+        )
+
+        if not chunks:
+            _log(db, project_id, "No hay escenas pendientes.", stage="veo")
+            _update_project(db, project, status=ProjectStatus.videos_ready)
+            return
+
+        total = len(chunks)
+        _log(db, project_id, f"{total} escenas a procesar con Veo.", stage="veo")
+
+        # ── STEP 1: Batch-generate video prompts via Gemini ──────────────
+        chunks_needing_prompt = [c for c in chunks if not c.image_prompt]
+        if chunks_needing_prompt:
+            try:
+                _log(db, project_id,
+                     f"Generando {len(chunks_needing_prompt)} prompts con Gemini…",
+                     stage="veo")
+                scenes_data = [
+                    {"scene_number": c.chunk_number, "narration": c.scene_text or ""}
+                    for c in chunks_needing_prompt
+                ]
+                prompt_map = google_service.batch_generate_image_prompts(
+                    scenes_data,
+                    reference_character=project.reference_character or "",
+                    full_script=project.script_final or "",
+                    visual_style=project.visual_style or "",
+                )
+                for c in chunks_needing_prompt:
+                    if c.chunk_number in prompt_map:
+                        _update_chunk(db, c, image_prompt=prompt_map[c.chunk_number])
+                db.commit()
+                db.expire_all()
+                chunks = (
+                    db.query(Chunk)
+                    .filter(Chunk.project_id == project_id, Chunk.status != ChunkStatus.done)
+                    .order_by(Chunk.chunk_number)
+                    .all()
+                )
+                _log(db, project_id,
+                     f"{len(prompt_map)} prompts generados. Iniciando Veo…",
+                     stage="veo")
+            except Exception as exc:
+                _log(db, project_id,
+                     f"Error en batch Gemini: {exc}",
+                     stage="veo", level="warning")
+
+        # ── STEP 2: Generate videos in parallel ──────────────────────────
+        slug = project.slug
+
+        def _gen_one_veo(chunk_number, visual_prompt, motion, key):
+            """Generate a single video clip with Veo."""
+            c_dir = chunk_dir(slug, chunk_number)
+            video_path = c_dir / "videos" / f"video_{chunk_number}.mp4"
+            video_path.parent.mkdir(parents=True, exist_ok=True)
+
+            # image_prompt already includes visual_style (Gemini embeds it)
+            full_prompt = visual_prompt
+            if motion:
+                full_prompt += f" Camera: {motion}."
+
+            veo_service.generate_video(
+                prompt=full_prompt,
+                output_path=video_path,
+                api_key=key,
+                aspect_ratio="16:9",
+                resolution="1080p",
+            )
+            return str(video_path).replace("\\", "/")
+
+        chunk_args = [
+            (c.chunk_number, c.image_prompt or c.scene_text or "",
+             c.motion_prompt or "Slow cinematic zoom in", veo_key)
+            for c in chunks
+        ]
+
+        errors: list[str] = []
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = {
+                pool.submit(_gen_one_veo, *args): args[0]
+                for args in chunk_args
+            }
+            done_count = 0
+            for future in as_completed(futures):
+                chunk_number = futures[future]
+                done_count += 1
+                try:
+                    vpath = future.result()
+                    chunk = db.query(Chunk).filter(
+                        Chunk.project_id == project_id,
+                        Chunk.chunk_number == chunk_number,
+                    ).first()
+                    if chunk:
+                        _update_chunk(db, chunk, video_path=vpath, status=ChunkStatus.done)
+                    _log(db, project_id,
+                         f"[{done_count}/{total}] Escena #{chunk_number} generada.",
+                         stage="veo_progress")
+                except Exception as exc:
+                    errors.append(f"Escena #{chunk_number}: {exc}")
+                    chunk = db.query(Chunk).filter(
+                        Chunk.project_id == project_id,
+                        Chunk.chunk_number == chunk_number,
+                    ).first()
+                    if chunk:
+                        _update_chunk(db, chunk, status=ChunkStatus.error,
+                                      error_message=str(exc)[:500])
+                    _log(db, project_id,
+                         f"Error escena #{chunk_number}: {exc}",
+                         stage="veo_progress", level="error")
+
+        if errors:
+            _update_project(db, project, status=ProjectStatus.videos_ready,
+                            error_message=f"{len(errors)} error(es): {'; '.join(errors[:3])}")
+            _log(db, project_id,
+                 f"Veo 3.1: {total - len(errors)}/{total} videos generados.",
+                 stage="veo_done", level="error")
+        else:
+            _update_project(db, project, status=ProjectStatus.videos_ready)
+            _log(db, project_id,
+                 f"{total} videos generados con GeminiGen.AI Veo 3.1.",
+                 stage="veo_done")
+
+    except Exception as exc:
+        db.rollback()
+        try:
+            project = db.query(Project).filter(Project.id == project_id).first()
+            if project:
+                _update_project(db, project, status=ProjectStatus.error,
+                                error_message=str(exc))
+            _log(db, project_id,
+                 f"Error en Veo: {exc}\n{traceback.format_exc()}",
+                 stage="veo_error", level="error")
+        except Exception:
+            pass
+    finally:
+        db.close()
+
+
+def start_generate_videos_veo(project_id: int) -> None:
+    """Launch Veo video generation in a background daemon thread."""
+    t = threading.Thread(target=_run_generate_videos_veo, args=(project_id,), daemon=True)
+    t.start()
+
+
+# ── Regenerate single scene video with Veo 3.1 ──────────────────────────────
+
+def _run_regenerate_video_veo(project_id: int, chunk_number: int) -> None:
+    """Re-generate ONLY the video for one scene using GeminiGen.AI Veo 3.1 Fast."""
+    from .video import veo_service
+
+    db = SessionLocal()
+    try:
+        project = db.query(Project).filter(Project.id == project_id).first()
+        if not project:
+            return
+
+        chunk = (
+            db.query(Chunk)
+            .filter(Chunk.project_id == project_id, Chunk.chunk_number == chunk_number)
+            .first()
+        )
+        if not chunk:
+            _log(db, project_id, f"Chunk {chunk_number} no encontrado.", stage="regen_veo", level="error")
+            return
+
+        veo_key = _get_db_setting(db, "geminigen_api_key") or settings.geminigen_api_key
+        if not veo_key:
+            _log(db, project_id, "GeminiGen.AI API key no configurada.", stage="regen_veo", level="error")
+            _update_chunk(db, chunk, status=ChunkStatus.error,
+                          error_message="GeminiGen.AI API key no configurada")
+            return
+
+        n = chunk.chunk_number
+
+        # Generate image_prompt with Gemini if not already set
+        if not chunk.image_prompt:
+            _log(db, project_id, f"[Veo 3.1] Generando prompt visual con Gemini para escena #{n}…", stage=f"regen_veo_{n}")
+            try:
+                scenes_data = [{"scene_number": n, "narration": chunk.scene_text or ""}]
+                prompt_map = google_service.batch_generate_image_prompts(
+                    scenes_data,
+                    reference_character=project.reference_character or "",
+                    full_script=project.script_final or "",
+                    visual_style=project.visual_style or "",
+                )
+                # Gemini may renumber keys starting from 1, so grab first value if n not found
+                generated_prompt = prompt_map.get(n) or (list(prompt_map.values())[0] if prompt_map else "")
+                if generated_prompt:
+                    _update_chunk(db, chunk, image_prompt=generated_prompt)
+                    db.commit()
+                    db.refresh(chunk)
+                    _log(db, project_id, f"[Veo 3.1] Prompt visual generado: {generated_prompt[:100]}…", stage=f"regen_veo_{n}")
+            except Exception as exc:
+                _log(db, project_id, f"[Veo 3.1] Error generando prompt con Gemini: {exc}", stage=f"regen_veo_{n}", level="warning")
+
+        prompt = (chunk.image_prompt or chunk.scene_text or "").strip()
+        if not prompt:
+            msg = "Sin prompt visual — genera los prompts primero o edita manualmente."
+            _log(db, project_id, f"[Regen Veo {n}] {msg}", stage="regen_veo", level="error")
+            _update_chunk(db, chunk, status=ChunkStatus.error, error_message=msg)
+            return
+
+        # image_prompt already includes visual_style (Gemini embeds it) — no suffix needed
+
+        motion = (chunk.motion_prompt or "").strip()
+        if motion:
+            prompt += f" Camera: {motion}."
+
+        c_dir = chunk_dir(project.slug, n)
+        video_path = c_dir / "videos" / f"video_{n}.mp4"
+        video_path.parent.mkdir(parents=True, exist_ok=True)
+
+        _log(db, project_id,
+             f"[Veo 3.1] Regenerando escena #{n}…",
+             stage=f"regen_veo_{n}")
+
+        veo_service.generate_video(
+            prompt=prompt,
+            output_path=video_path,
+            api_key=veo_key,
+            aspect_ratio="16:9",
+            resolution="1080p",
+        )
+
+        _update_chunk(db, chunk, video_path=str(video_path).replace("\\", "/"),
+                      status=ChunkStatus.done, error_message=None)
+        _log(db, project_id,
+             f"[Veo 3.1] ✅ Escena #{n} regenerada.",
+             stage=f"regen_veo_{n}_done")
+
+    except Exception as exc:
+        _log(db, project_id,
+             f"[Regen Veo {chunk_number}] Error: {exc}",
+             stage="regen_veo_error", level="error")
+        try:
+            db.expire_all()
+            chunk = db.query(Chunk).filter(
+                Chunk.project_id == project_id, Chunk.chunk_number == chunk_number
+            ).first()
+            if chunk:
+                _update_chunk(db, chunk, status=ChunkStatus.error, error_message=str(exc)[:500])
+        except Exception:
+            pass
+    finally:
+        db.close()
+
+
+def start_regenerate_video_veo(project_id: int, chunk_number: int) -> None:
+    """Launch single-chunk Veo 3.1 video regeneration in a background daemon thread."""
+    t = threading.Thread(
+        target=_run_regenerate_video_veo,
+        args=(project_id, chunk_number),
+        daemon=True,
+    )
+    t.start()
+
+
+# ── Regenerate single scene video with Grok 3 ───────────────────────────────
+
+def _run_regenerate_video_grok(project_id: int, chunk_number: int) -> None:
+    """Re-generate ONLY the video for one scene using Grok 3 via GeminiGen.AI."""
+    from .video import veo_service
+
+    db = SessionLocal()
+    try:
+        project = db.query(Project).filter(Project.id == project_id).first()
+        if not project:
+            return
+
+        chunk = (
+            db.query(Chunk)
+            .filter(Chunk.project_id == project_id, Chunk.chunk_number == chunk_number)
+            .first()
+        )
+        if not chunk:
+            _log(db, project_id, f"Chunk {chunk_number} no encontrado.", stage="regen_grok", level="error")
+            return
+
+        grok_key = _get_db_setting(db, "geminigen_api_key") or settings.geminigen_api_key
+        if not grok_key:
+            _log(db, project_id, "GeminiGen.AI API key no configurada.", stage="regen_grok", level="error")
+            _update_chunk(db, chunk, status=ChunkStatus.error,
+                          error_message="GeminiGen.AI API key no configurada")
+            return
+
+        n = chunk.chunk_number
+
+        # Generate image_prompt with Gemini if not already set
+        if not chunk.image_prompt:
+            _log(db, project_id, f"[Grok 3] Generando prompt visual con Gemini para escena #{n}…", stage=f"regen_grok_{n}")
+            try:
+                scenes_data = [{"scene_number": n, "narration": chunk.scene_text or ""}]
+                prompt_map = google_service.batch_generate_image_prompts(
+                    scenes_data,
+                    reference_character=project.reference_character or "",
+                    full_script=project.script_final or "",
+                    visual_style=project.visual_style or "",
+                )
+                generated_prompt = prompt_map.get(n) or (list(prompt_map.values())[0] if prompt_map else "")
+                if generated_prompt:
+                    _update_chunk(db, chunk, image_prompt=generated_prompt)
+                    db.commit()
+                    db.refresh(chunk)
+            except Exception as exc:
+                _log(db, project_id, f"[Grok 3] Error generando prompt con Gemini: {exc}", stage=f"regen_grok_{n}", level="warning")
+
+        prompt = (chunk.image_prompt or chunk.scene_text or "").strip()
+        if not prompt:
+            msg = "Sin prompt visual — genera los prompts primero o edita manualmente."
+            _log(db, project_id, f"[Regen Grok {n}] {msg}", stage="regen_grok", level="error")
+            _update_chunk(db, chunk, status=ChunkStatus.error, error_message=msg)
+            return
+
+        motion = (chunk.motion_prompt or "").strip()
+        if motion:
+            prompt += f" Camera: {motion}."
+
+        c_dir = chunk_dir(project.slug, n)
+        video_path = c_dir / "videos" / f"video_{n}.mp4"
+        video_path.parent.mkdir(parents=True, exist_ok=True)
+
+        _log(db, project_id,
+             f"[Grok 3] Regenerando escena #{n}…",
+             stage=f"regen_grok_{n}")
+
+        veo_service.generate_video_grok(
+            prompt=prompt,
+            output_path=video_path,
+            api_key=grok_key,
+            duration_seconds=10,
+            aspect_ratio="landscape",
+            resolution="720p",
+        )
+
+        _update_chunk(db, chunk, video_path=str(video_path).replace("\\", "/"),
+                      status=ChunkStatus.done, error_message=None)
+        _log(db, project_id,
+             f"[Grok 3] ✅ Escena #{n} regenerada.",
+             stage=f"regen_grok_{n}_done")
+
+    except Exception as exc:
+        _log(db, project_id,
+             f"[Regen Grok {chunk_number}] Error: {exc}",
+             stage="regen_grok_error", level="error")
+        try:
+            db.expire_all()
+            chunk = db.query(Chunk).filter(
+                Chunk.project_id == project_id, Chunk.chunk_number == chunk_number
+            ).first()
+            if chunk:
+                _update_chunk(db, chunk, status=ChunkStatus.error, error_message=str(exc)[:500])
+        except Exception:
+            pass
+    finally:
+        db.close()
+
+
+def start_regenerate_video_grok(project_id: int, chunk_number: int) -> None:
+    """Launch single-chunk Grok 3 video regeneration in a background daemon thread."""
+    t = threading.Thread(
+        target=_run_regenerate_video_grok,
+        args=(project_id, chunk_number),
+        daemon=True,
+    )
     t.start()
 
 

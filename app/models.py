@@ -18,6 +18,9 @@ class ProjectStatus(str, enum.Enum):
     scenes_ready = "scenes_ready"
     generating_images = "generating_images"
     images_ready = "images_ready"
+    animating = "animating"
+    generating_videos = "generating_videos"
+    videos_ready = "videos_ready"
     rendering = "rendering"
     done = "done"
     error = "error"
@@ -53,12 +56,14 @@ class Project(Base):
     video_type = Column(String(50), nullable=True, default="top10")
     duration = Column(String(20), nullable=True, default="6-8")
     reference_character = Column(String(255), nullable=True)
+    character_anchor = Column(Text, nullable=True)  # verbatim character description appended to every image prompt
     reference_character_path = Column(String(512), nullable=True)  # character reference image for kontext
     reference_style_path = Column(String(512), nullable=True)      # style reference image for kontext
     script = Column(Text, nullable=True)
     script_approved = Column(Boolean, default=False, nullable=False)
     script_final = Column(Text, nullable=True)
     outline = Column(Text, nullable=True)
+    custom_script = Column(Text, nullable=True)  # User-provided script (skips AI generation)
     reference_transcripts = Column(Text, nullable=True)  # JSON string
     target_chunk_size = Column(Integer, default=1500, nullable=False)
     # TTS voice configuration (set by user after chunks are created)
@@ -72,6 +77,8 @@ class Project(Base):
     preview_path = Column(String(512), nullable=True)       # path to preview.mp4
     preview_progress = Column(Integer, default=0)           # 0-100 preview render %
     render_progress = Column(Integer, default=0)            # 0-100 render %
+    visual_style = Column(Text, nullable=True)  # per-project visual style for image prompts
+    video_pipeline = Column(String(50), nullable=True, default="default")  # "default" or "veo"
     collection = Column(String(100), nullable=True, default="general")  # stock footage collection
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

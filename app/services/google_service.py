@@ -39,58 +39,53 @@ def _chat(system: str, user: str, max_tokens: int = 4096) -> str:
 
 # ── Batch Image Prompt Generation ────────────────────────────────────────────
 
-_BATCH_PROMPT_SYSTEM = """You are an expert visual prompt engineer for cinematic AI image generation.
-You will receive the FULL SCRIPT of a video for context, and a list of scenes.
-For each scene, generate a detailed image prompt that reflects the EXACT moment in the story.
+_BATCH_PROMPT_SYSTEM = """You are a CINEMATOGRAPHER creating SHORT image prompts for AI video generation.
 
-IMPORTANT: Use the full script to understand WHO the characters are, WHERE the story takes place,
-WHAT TIME PERIOD it is set in, and WHAT IS HAPPENING narratively. Each image must feel like it
-belongs to this specific story, not a generic image.
+=== BEFORE WRITING EACH PROMPT ===
+Read the scene narration and ask yourself:
+1. Is this about an ancient/biblical event? → Use the VISUAL STYLE setting.
+2. Is this a modern fact, statistic, or present-day concept? → Use a MODERN setting (hospitals, cities, technology, monitors, modern people, etc.)
+3. Is this abstract/emotional? → Use symbolic imagery (close-ups, textures, light/shadow, empty spaces).
 
-CRITICAL RULES FOR VISUAL CONSISTENCY:
-- Every prompt must share the SAME visual style: cinematic, dark moody lighting, rich color grading.
-- Use consistent color palette across all scenes (deep shadows, warm highlights, desaturated midtones).
-- Camera style: professional documentary cinematography (wide establishing shots, medium close-ups, aerial views).
-- Lighting: dramatic natural light, golden hour, volumetric fog, rim lighting, chiaroscuro.
-- NO people, NO characters, NO faces, NO human figures unless the narration explicitly describes a specific person.
-- Focus on: landscapes, architecture, objects, environments, abstract concepts, aerial views, macro details.
-- Aspect ratio: 16:9 widescreen. No text, no watermarks, no logos, no borders.
-- Each prompt must be self-contained (describe everything needed to generate the image).
-- Include story-specific details: locations, objects, symbols, time period, atmosphere from the script.
+The VISUAL STYLE is the DEFAULT look, but you MUST override it when the narration demands a different era or context.
 
-For each scene, produce a rich, comma-separated description including:
-- Subject and composition (specific to the story moment)
-- Lighting and color palette
-- Camera angle and lens (e.g., wide-angle, telephoto, drone shot)
-- Mood and atmosphere (matching the narrative tone)
-- Textures, details, and story-specific elements
+=== CORE RULES ===
+- 40-60 words per prompt. No exceptions.
+- Do NOT copy any text from the VISUAL STYLE into your prompts. Internalize it, don't paste it.
+- WHO + WHAT + WHERE + CAMERA + LIGHTING in every prompt.
+- Vary compositions: wide/close, interior/exterior, day/night.
+- NO text, watermarks, logos, borders.
 
 Return ONLY valid JSON — no markdown fences, no extra text."""
 
-_BATCH_PROMPT_TEMPLATE = """Generate detailed cinematic image prompts for the scenes listed below.
-
-VISUAL STYLE: {reference_style}
+_BATCH_PROMPT_TEMPLATE = """Generate SHORT image prompts (40-60 words each) for these scenes.
 
 ══════════════════════════════════════
-FULL SCRIPT (for narrative context — read this to understand the story, characters, locations, and time period):
+VISUAL STYLE (internalize — do NOT copy into prompts):
+══════════════════════════════════════
+{reference_style}
+
+══════════════════════════════════════
+FULL SCRIPT (for narrative context):
 ══════════════════════════════════════
 {full_script}
 
 ══════════════════════════════════════
-SCENES TO GENERATE PROMPTS FOR:
+SCENES:
 ══════════════════════════════════════
 {scenes_block}
 
-For each scene, generate an image prompt that captures the EXACT narrative moment described.
-Use specific details from the script (locations, objects, atmosphere, time period) — NOT generic images.
+RULES:
+- 40-60 words per prompt. No exceptions.
+- WHO + WHAT + WHERE + CAMERA + LIGHTING in every prompt.
+- Do NOT copy the visual style text. Use your own words inspired by it.
+- Do NOT include any character anchor text — it is added automatically.
+- Vary composition across scenes.
 
 Return JSON:
 {{
   "prompts": [
-    {{
-      "scene_number": 1,
-      "image_prompt": "Detailed cinematic prompt for scene 1 with story-specific details..."
-    }},
+    {{"scene_number": 1, "image_prompt": "A concise 40-60 word cinematic description."}},
     ...
   ]
 }}"""
@@ -99,18 +94,84 @@ Return JSON:
 _MAX_SCRIPT_WORDS_SINGLE_BATCH = 3000
 _SCENES_PER_BATCH = 10
 
+# ── Prompt quality filter: block modern/anachronistic content ─────────────────
+_BANNED_WORDS = [
+    "watermark", "logo", "border", "text overlay", "subtitle",
+    "stock photo", "shutterstock", "getty",
+]
+
+
+def _has_banned_words(prompt: str) -> list[str]:
+    """Return list of banned words found in a prompt."""
+    lower = prompt.lower()
+    return [w for w in _BANNED_WORDS if w.lower() in lower]
+
+
+def _clean_prompt(prompt: str, visual_style: str, max_words: int = 80) -> str:
+    """Remove visual_style contamination from a prompt and enforce word limit."""
+    import difflib
+
+    if not visual_style or not prompt:
+        return prompt
+
+    # 1. Sentence-level dedup: remove prompt sentences too similar to visual_style
+    style_sentences = [s.strip() for s in re.split(r'[.!]\s+', visual_style) if len(s.strip()) > 10]
+    prompt_sentences = [s.strip() for s in re.split(r'(?<=[.!])\s+', prompt) if s.strip()]
+
+    kept = []
+    for ps in prompt_sentences:
+        is_copy = False
+        for ss in style_sentences:
+            ratio = difflib.SequenceMatcher(None, ps.lower(), ss.lower()).ratio()
+            if ratio > 0.6:
+                is_copy = True
+                break
+        if not is_copy:
+            kept.append(ps)
+
+    cleaned = " ".join(kept)
+
+    # 2. Fragment removal: remove 5+ word verbatim fragments from visual_style
+    style_words = visual_style.split()
+    for window_size in range(min(8, len(style_words)), 4, -1):
+        for i in range(len(style_words) - window_size + 1):
+            fragment = " ".join(style_words[i:i + window_size])
+            if fragment.lower() in cleaned.lower():
+                cleaned = re.sub(re.escape(fragment), "", cleaned, flags=re.IGNORECASE)
+
+    # 3. Clean whitespace artifacts
+    cleaned = re.sub(r'\s{2,}', ' ', cleaned).strip()
+    cleaned = re.sub(r'^[,.\s]+', '', cleaned)
+
+    # 4. Word limit enforcement with intelligent truncation
+    words = cleaned.split()
+    if len(words) > max_words:
+        truncated = " ".join(words[:max_words])
+        last_period = truncated.rfind(".")
+        if last_period > len(truncated) // 2:
+            truncated = truncated[:last_period + 1]
+        cleaned = truncated
+
+    return cleaned.strip()
+
 
 def batch_generate_image_prompts(
     scenes: list[dict],
     reference_character: str = "",
     full_script: str = "",
+    visual_style: str = "",
 ) -> dict[int, str]:
     """Send scenes + full script context to Gemini and return {scene_number: prompt}.
 
     If the script is long (>3000 words), scenes are processed in batches of 10
     but the full script is always included for context.
+    Includes automatic validation: any prompt with modern/anachronistic words
+    is regenerated up to 2 times.
     """
-    style = reference_character or "cinematic, photorealistic, documentary, dark moody lighting, no people"
+    style = visual_style or reference_character or "photorealistic cinematic, dramatic lighting, shallow depth of field, film grain, 16:9 widescreen"
+    print(f"[ImagePrompts] Visual style: {style[:80]}...")
+
+
     script_text = (full_script or "").strip()
     if not script_text:
         script_text = "(No full script provided — use each scene's narration as context.)"
@@ -131,9 +192,29 @@ def batch_generate_image_prompts(
             print(f"[ImagePrompts] Batch {i // _SCENES_PER_BATCH + 1}: scenes {batch[0]['scene_number']}-{batch[-1]['scene_number']}")
             batch_result = _generate_batch(batch, style, script_text)
             all_results.update(batch_result)
-        return all_results
     else:
-        return _generate_batch(scenes, style, script_text)
+        all_results = _generate_batch(scenes, style, script_text)
+
+    # ── Validate & retry bad prompts (up to 2 retries) ────────────────────────
+    scenes_by_num = {s["scene_number"]: s for s in scenes}
+    for retry in range(2):
+        bad_nums = [n for n, p in all_results.items() if _has_banned_words(p)]
+        if not bad_nums:
+            break
+        bad_scenes = [scenes_by_num[n] for n in bad_nums if n in scenes_by_num]
+        if not bad_scenes:
+            break
+        print(f"[ImagePrompts] Retry {retry + 1}: {len(bad_nums)} prompts with banned words {bad_nums}")
+        retry_results = _generate_batch(bad_scenes, style, script_text)
+        all_results.update(retry_results)
+
+    # Log any still-bad prompts (but don't block)
+    still_bad = {n: _has_banned_words(p) for n, p in all_results.items() if _has_banned_words(p)}
+    if still_bad:
+        for n, words in still_bad.items():
+            print(f"[ImagePrompts] WARNING: scene {n} still has banned words after retries: {words}")
+
+    return all_results
 
 
 def _generate_batch(scenes: list[dict], style: str, script_text: str) -> dict[int, str]:
@@ -155,7 +236,19 @@ def _generate_batch(scenes: list[dict], style: str, script_text: str) -> dict[in
     raw = re.sub(r"\s*```$", "", raw)
     data = json.loads(raw)
 
-    return {int(item["scene_number"]): item["image_prompt"] for item in data["prompts"]}
+    results = {int(item["scene_number"]): item["image_prompt"] for item in data["prompts"]}
+
+    # ── Post-process: clean visual_style contamination and enforce word limit ──
+    for scene_num in results:
+        original_wc = len(results[scene_num].split())
+        results[scene_num] = _clean_prompt(results[scene_num], style)
+        new_wc = len(results[scene_num].split())
+        if original_wc != new_wc:
+            print(f"[ImagePrompts] Scene {scene_num}: {original_wc} -> {new_wc} words (cleaned)")
+
+    # character_anchor removed — Gemini handles character descriptions contextually
+
+    return results
 
 
 # ── Batch Video Prompt Generation (Motion Instructions) ──────────────────────

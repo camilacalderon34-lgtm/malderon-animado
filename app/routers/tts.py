@@ -47,6 +47,27 @@ def list_voices(payload: VoiceListRequest, db: Session = Depends(get_db)):
         except Exception as exc:
             raise HTTPException(status_code=502, detail=f"Error cargando voces: {exc}")
 
+    if payload.tts_provider == "xtts":
+        from ..services.tts.xtts import XTTTS
+        server_url = payload.tts_api_key or "http://192.168.1.41:7861"
+        provider = XTTTS(api_key=server_url, config={})
+        try:
+            raw = provider.list_voices()
+            voice_names = raw.get("voices", raw) if isinstance(raw, dict) else raw
+            voices = [
+                {
+                    "voice_id": name,
+                    "name": name,
+                    "description": "XTTS local voice",
+                    "language": "es",
+                    "category": "local",
+                }
+                for name in voice_names
+            ]
+            return {"voices": voices}
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Error conectando al servidor XTTS: {exc}")
+
     raise HTTPException(
         status_code=501,
         detail=f"Listado de voces no soportado para el proveedor '{payload.tts_provider}'",

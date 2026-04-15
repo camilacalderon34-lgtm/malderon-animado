@@ -72,7 +72,9 @@ const STATUS_ICONS = {
   audio_approved: '✅',
   scenes_ready: '🎬',
   generating_images: '🖼️',
+  generating_videos: '🎬',
   images_ready: '✅',
+  videos_ready: '✅',
   rendering: '🎬',
   done: '✅',
   error: '❌',
@@ -172,6 +174,8 @@ async function openDetail(projectId) {
   _selectedVoiceId = '';
   _selectedVoiceName = '';
   _allVoices = [];
+  window._chunkPageLimit = 50;
+  window._chunkFingerprints = {};
 
   // Pre-load settings so the API key warning is accurate when voice config shows
   await _fetchSettings();
@@ -336,12 +340,15 @@ async function refreshDetail(projectId) {
     const isAudioApproved = p.status === 'audio_approved';
     const isScenesReady = p.status === 'scenes_ready';
     const isGeneratingImages = p.status === 'generating_images';
+    const isGeneratingVideos = p.status === 'generating_videos';
     const isImagesReady = p.status === 'images_ready';
+    const isVideosReady = p.status === 'videos_ready';
     const isErrorWithVO = p.status === 'error' && !!p.voiceover_path;
     const isRendering = p.status === 'rendering';
     const isDone = p.status === 'done';
     const isErrorWithMedia = p.status === 'error' && chunks.some(c => c.image_path || c.video_path);
-    const showImagePanel = isScenesReady || isGeneratingImages || isImagesReady || isRendering || isDone || isErrorWithMedia;
+    const isVeoPipeline = p.video_pipeline === 'veo';
+    const showImagePanel = isScenesReady || isGeneratingImages || isGeneratingVideos || isImagesReady || isVideosReady || isRendering || isDone || isErrorWithMedia;
     const hasVoiceover = !!p.voiceover_path;
 
     if (approvalSection && hasVoiceover) {
@@ -398,6 +405,14 @@ async function refreshDetail(projectId) {
             <div class="st-col st-time">Tiempo</div>
             <div class="st-col st-status">Estado</div>
             <div class="st-col st-actions"></div>`;
+        } else if (isVeoPipeline) {
+          hdr.innerHTML = `
+            <div class="st-col st-num">#</div>
+            <div class="st-col st-text">Guion</div>
+            <div class="st-col st-vid">Video</div>
+            <div class="st-col st-time">Tiempo</div>
+            <div class="st-col st-status">Estado</div>
+            <div class="st-col st-actions"></div>`;
         } else {
           hdr.innerHTML = `
             <div class="st-col st-num">#</div>
@@ -429,9 +444,15 @@ async function refreshDetail(projectId) {
         return `${m}:${String(s).padStart(2, '0')}`;
       };
 
+      // ── Pagination: show only CHUNK_PAGE_SIZE chunks at a time ──
+      const CHUNK_PAGE_SIZE = 50;
+      if (!window._chunkPageLimit) window._chunkPageLimit = CHUNK_PAGE_SIZE;
+      const visibleChunks = chunks.slice(0, window._chunkPageLimit);
+      const hasMore = chunks.length > window._chunkPageLimit;
+
       // Build per-chunk fingerprints to detect individual row changes
       if (!window._chunkFingerprints) window._chunkFingerprints = {};
-      const needsFullBuild = list.children.length === 0 || list.children.length !== chunks.length;
+      const needsFullBuild = list.children.length === 0 || list.dataset.count !== String(visibleChunks.length);
       const changedChunks = new Set();
       chunks.forEach(c => {
         const fp = `${c.chunk_number}:${c.status}:${c.image_path||''}:${c.video_path||''}:${c.image_prompt||''}:${c.motion_prompt||''}:${c.asset_type||''}:${c.updated_at||''}`;
@@ -446,8 +467,9 @@ async function refreshDetail(projectId) {
         // No changes — skip rebuild to avoid flicker
       } else {
         if (needsFullBuild) list.innerHTML = '';
+        list.dataset.count = String(visibleChunks.length);
 
-        chunks.forEach((c, idx) => {
+        visibleChunks.forEach((c, idx) => {
           const n = c.chunk_number;
           // Skip unchanged rows (only when doing partial update)
           if (!needsFullBuild && !changedChunks.has(n)) return;
@@ -535,6 +557,9 @@ async function refreshDetail(projectId) {
             if (c.image_path) {
               actions += `<button class="st-action-btn" title="Reanimar video" onclick="event.stopPropagation(); retryMetaAnimation(${n})">&#x26A1;</button>`;
             }
+            if (c.image_prompt || c.scene_text) {
+              actions += `<button class="st-action-btn" title="Regenerar video (Veo 3.1)" onclick="event.stopPropagation(); regenerateVideoVeo(${n})">&#x1F3AC;</button>`;
+            }
           }
 
           // Build "Salida" cell for stock mode (shows whatever output exists)
@@ -566,6 +591,19 @@ async function refreshDetail(projectId) {
               <div class="st-col st-status"><span class="st-status-badge ${statusClass}">${statusLabel}</span></div>
               <div class="st-col st-actions">${actions}</div>
             `;
+          } else if (isVeoPipeline) {
+            // Veo pipeline: # | Guion | Video | Tiempo | Estado | Actions (no image column)
+            row.innerHTML = `
+              <div class="st-col st-num">${n}</div>
+              <div class="st-col st-text">
+                <div class="st-script">${escHtml(text)}</div>
+                ${promptTags ? `<div class="st-prompts">${promptTags}</div>` : ''}
+              </div>
+              <div class="st-col st-vid">${vidCell}</div>
+              <div class="st-col st-time">${timeHtml}</div>
+              <div class="st-col st-status"><span class="st-status-badge ${statusClass}">${statusLabel}</span></div>
+              <div class="st-col st-actions">${actions}</div>
+            `;
           } else {
             // Animated: # | Imagen | Guion | Video | Tiempo | Estado | Actions
             row.innerHTML = `
@@ -589,6 +627,18 @@ async function refreshDetail(projectId) {
             if (existing) existing.replaceWith(row);
           }
         });
+
+        // "Show more" button for pagination
+        const existingShowMore = list.querySelector('.show-more-btn');
+        if (existingShowMore) existingShowMore.remove();
+        if (hasMore) {
+          const btn = document.createElement('div');
+          btn.className = 'show-more-btn';
+          btn.style.cssText = 'text-align:center;padding:12px;cursor:pointer;color:var(--accent);font-weight:600;';
+          btn.textContent = `Mostrar más (${window._chunkPageLimit} de ${chunks.length})`;
+          btn.onclick = () => { window._chunkPageLimit += CHUNK_PAGE_SIZE; refreshDetail(currentProjectId); };
+          list.appendChild(btn);
+        }
       }
     } else {
       chunksSection.style.display = 'none';
@@ -604,6 +654,20 @@ async function refreshDetail(projectId) {
 
       const animatedControls = document.getElementById('animatedModeControls');
       if (animatedControls) animatedControls.style.display = isStock ? 'none' : '';
+
+      // Veo pipeline: hide reference images, generate images btn, animation section; show Veo section
+      const refImagesSection = document.getElementById('referenceImagesSection');
+      const generateImagesBtn = document.getElementById('generateImagesBtn');
+      const veo3AnimationSection = document.getElementById('veo3AnimationSection');
+      const veoPipelineSection = document.getElementById('veoPipelineSection');
+      if (isVeoPipeline && !isStock) {
+        if (refImagesSection) refImagesSection.style.display = 'none';
+        if (generateImagesBtn) generateImagesBtn.style.display = 'none';
+        if (veo3AnimationSection) veo3AnimationSection.style.display = 'none';
+      } else {
+        if (refImagesSection) refImagesSection.style.display = '';
+        if (veoPipelineSection) veoPipelineSection.style.display = 'none';
+      }
 
       // Show/hide stock action buttons in the chunks header
       const stockBtns = document.getElementById('stockActionButtons');
@@ -646,6 +710,14 @@ async function refreshDetail(projectId) {
         if (deleteStyleBtn) deleteStyleBtn.style.display = 'none';
       }
 
+      // Visual Style text field — load from separate endpoint
+      const visualStyleInput = document.getElementById('visualStyleInput');
+      if (visualStyleInput) {
+        fetch(`/api/projects/${p.id}/visual-style`).then(r => r.json()).then(d => {
+          visualStyleInput.value = d.visual_style || '';
+        }).catch(() => {});
+      }
+
       if (showImagePanel) {
         const doneImgs = chunks.filter(c => c.image_path).length;
         const label = document.getElementById('scenesReadyLabel');
@@ -654,7 +726,46 @@ async function refreshDetail(projectId) {
         const continueBtn = document.getElementById('continueWithVideoBtn');
         const hint = document.getElementById('scenesReadyHint');
 
-        if (isGeneratingImages) {
+        if (isGeneratingVideos) {
+          // Veo pipeline: generating videos
+          const doneVids = chunks.filter(c => c.video_path).length;
+          if (label) label.textContent = `🎬 Generando video ${doneVids} de ${chunks.length} con Veo…`;
+          if (progressCount) { progressCount.style.display = ''; progressCount.textContent = `${doneVids} de ${chunks.length} videos completados`; }
+          if (generateBtn) generateBtn.style.display = 'none';
+          if (continueBtn) continueBtn.style.display = 'none';
+          if (hint) hint.textContent = 'Google Veo está generando video para cada escena. Puedes seguir viendo el progreso en vivo.';
+          // Update Veo button state
+          const veoBtn = document.getElementById('generateVeoBtn');
+          if (veoBtn) { veoBtn.disabled = true; veoBtn.textContent = `⏳ Generando con Veo… (${doneVids}/${chunks.length})`; }
+          if (veoPipelineSection) veoPipelineSection.style.display = 'block';
+        } else if (isVideosReady) {
+          // Veo pipeline: videos ready
+          const doneVids = chunks.filter(c => c.video_path).length;
+          const hasErrors = chunks.some(c => c.status === 'error');
+          if (label) label.textContent = hasErrors
+            ? `⚠️ ${doneVids} de ${chunks.length} videos generados (con errores)`
+            : `✅ ${doneVids} videos generados con Veo`;
+          if (progressCount) { progressCount.style.display = ''; progressCount.textContent = `${doneVids} videos de ${chunks.length}`; }
+          if (generateBtn) generateBtn.style.display = 'none';
+          if (continueBtn) continueBtn.style.display = 'none';
+          if (hint) hint.textContent = hasErrors
+            ? 'Algunos videos fallaron. Puedes reintentar con el botón de Veo.'
+            : '✅ Videos listos. Puedes ir a edición para renderizar el video final.';
+          // Update Veo button state
+          if (veoPipelineSection) veoPipelineSection.style.display = 'block';
+          const veoBtn = document.getElementById('generateVeoBtn');
+          const veoProgress = document.getElementById('veoProgress');
+          if (veoProgress) veoProgress.textContent = `${doneVids} de ${chunks.length} videos`;
+          if (veoBtn) {
+            if (hasErrors) {
+              veoBtn.disabled = false;
+              veoBtn.textContent = '🔄 Reintentar Videos Fallidos';
+            } else {
+              veoBtn.disabled = true;
+              veoBtn.textContent = '✅ Todos los videos generados';
+            }
+          }
+        } else if (isGeneratingImages) {
           if (label) label.textContent = `🎨 Generando escena ${doneImgs} de ${chunks.length}…`;
           if (progressCount) { progressCount.style.display = ''; progressCount.textContent = `${doneImgs} de ${chunks.length} escenas completadas`; }
           if (generateBtn) { generateBtn.style.display = ''; generateBtn.disabled = true; generateBtn.textContent = `⏳ Generando con ${_imgProviderName()}…`; }
@@ -697,6 +808,28 @@ async function refreshDetail(projectId) {
           }
           regenAllBtn.style.display = '';
 
+          // "Generar faltantes" button — only images that don't exist yet
+          const missingCount = chunks.filter(c => !c.image_path).length;
+          let genMissingBtn = document.getElementById('genMissingImages');
+          if (!genMissingBtn) {
+            genMissingBtn = document.createElement('button');
+            genMissingBtn.id = 'genMissingImages';
+            genMissingBtn.className = 'btn btn-primary btn-sm';
+            genMissingBtn.style.marginTop = '8px';
+            genMissingBtn.style.marginLeft = '8px';
+            genMissingBtn.onclick = generateMissingImages;
+            regenAllBtn.parentNode.insertBefore(genMissingBtn, regenAllBtn.nextSibling);
+          }
+          if (missingCount > 0) {
+            genMissingBtn.textContent = `🖼️ Generar ${missingCount} imágenes faltantes`;
+            genMissingBtn.disabled = false;
+            genMissingBtn.style.display = '';
+          } else {
+            genMissingBtn.textContent = '✅ Todas las imágenes generadas';
+            genMissingBtn.disabled = true;
+            genMissingBtn.style.display = '';
+          }
+
           // Show Veo3 Animation Block
           const veo3Section = document.getElementById('veo3AnimationSection');
           if (veo3Section) {
@@ -720,11 +853,22 @@ async function refreshDetail(projectId) {
         }
         else {
           // scenes_ready — ready to generate
-          if (label) label.textContent = `✅ ${chunks.length} escenas listas para generar`;
-          if (progressCount) progressCount.style.display = 'none';
-          if (generateBtn) { generateBtn.style.display = ''; generateBtn.disabled = false; generateBtn.textContent = `🎨 Generar Imágenes (${_imgProviderName()})`; }
-          if (continueBtn) continueBtn.style.display = 'none';
-          if (hint) hint.textContent = `Gemini generará un prompt visual por escena, luego ${_imgProviderName()} creará la imagen (16:9).`;
+          if (isVeoPipeline) {
+            if (label) label.textContent = `✅ ${chunks.length} escenas listas para generar video`;
+            if (progressCount) progressCount.style.display = 'none';
+            if (generateBtn) generateBtn.style.display = 'none';
+            if (continueBtn) continueBtn.style.display = 'none';
+            if (hint) hint.textContent = 'Google Veo generará un video directamente desde el texto de cada escena.';
+            if (veoPipelineSection) veoPipelineSection.style.display = 'block';
+            const veoBtn = document.getElementById('generateVeoBtn');
+            if (veoBtn) { veoBtn.disabled = false; veoBtn.textContent = '🎬 Generar Videos con Veo'; }
+          } else {
+            if (label) label.textContent = `✅ ${chunks.length} escenas listas para generar`;
+            if (progressCount) progressCount.style.display = 'none';
+            if (generateBtn) { generateBtn.style.display = ''; generateBtn.disabled = false; generateBtn.textContent = `🎨 Generar Imágenes (${_imgProviderName()})`; }
+            if (continueBtn) continueBtn.style.display = 'none';
+            if (hint) hint.textContent = `Gemini generará un prompt visual por escena, luego ${_imgProviderName()} creará la imagen (16:9).`;
+          }
         }
       }
     }
@@ -733,7 +877,7 @@ async function refreshDetail(projectId) {
     const goToEditingSection = document.getElementById('goToEditingSection');
     const doneVideos = chunks.filter(c => c.video_path).length;
     const hasVideos = doneVideos > 0;
-    const showEditing = ['images_ready', 'rendering', 'done', 'error'].includes(p.status) && hasVideos;
+    const showEditing = ['images_ready', 'videos_ready', 'rendering', 'done', 'error'].includes(p.status) && hasVideos;
     if (goToEditingSection) {
       goToEditingSection.style.display = showEditing ? '' : 'none';
       const btn = document.getElementById('goToEditingBtn');
@@ -759,7 +903,7 @@ async function refreshDetail(projectId) {
     if (legacyContainer) legacyContainer.style.display = 'none';
 
     // ── Stop polling when in stable state ─────────────────────────────────
-    if (['done', 'error', 'awaiting_approval', 'awaiting_voice_config', 'awaiting_audio_approval', 'audio_approved', 'scenes_ready', 'images_ready'].includes(p.status)) {
+    if (['done', 'error', 'awaiting_approval', 'awaiting_voice_config', 'awaiting_audio_approval', 'audio_approved', 'scenes_ready', 'images_ready', 'videos_ready'].includes(p.status)) {
       // Keep polling while Veo3 animation is running (videos still being generated)
       const animating = p.status === 'images_ready' && chunks.some(c => c.image_path && !c.video_path);
       if (!animating) stopPolling();
@@ -865,7 +1009,7 @@ async function loadSettingsPage() {
 
   const masked = '••••••••';
   const fields = [
-    'anthropic_api_key', 'genaipro_api_key', 'pollinations_api_key', 'wavespeed_api_key',
+    'anthropic_api_key', 'genaipro_api_key', 'geminigen_api_key', 'pollinations_api_key', 'wavespeed_api_key',
     'google_api_key', 'pexels_api_key', 'pixabay_api_key',
     'image_provider',
     'default_tts_provider', 'default_tts_voice_id', 'default_tts_model_id',
@@ -1052,7 +1196,39 @@ modeOptions.forEach(opt => {
     document.getElementById('characterGroup').style.display = isAnimated ? '' : 'none';
     const collectionGroup = document.getElementById('collectionGroup');
     if (collectionGroup) collectionGroup.style.display = isAnimated ? 'none' : '';
+    const pipelineGroup = document.getElementById('pipelineGroup');
+    if (pipelineGroup) pipelineGroup.style.display = isAnimated ? '' : 'none';
     if (!isAnimated) loadCollections();
+  });
+});
+
+// Pipeline sub-selector active state toggle
+const pipelineOptions = document.querySelectorAll('#pipelineGroup .pipeline-option');
+pipelineOptions.forEach(opt => {
+  opt.addEventListener('click', () => {
+    pipelineOptions.forEach(o => o.classList.remove('active'));
+    opt.classList.add('active');
+  });
+});
+
+// TTS provider selector toggle (voice config section)
+const ttsProviderOptions = document.querySelectorAll('#voiceConfigSection .pipeline-option');
+ttsProviderOptions.forEach(opt => {
+  opt.addEventListener('click', () => {
+    ttsProviderOptions.forEach(o => o.classList.remove('active'));
+    opt.classList.add('active');
+    const isXtts = opt.querySelector('input').value === 'xtts';
+    // Show/hide XTTS server URL
+    const xttsGroup = document.getElementById('xttsServerGroup');
+    if (xttsGroup) xttsGroup.style.display = isXtts ? '' : 'none';
+    // Show/hide GenAIPro-specific controls (model, sliders)
+    const modelGroup = document.getElementById('ttsModelId')?.closest('.vconfig-group');
+    if (modelGroup) modelGroup.style.display = isXtts ? 'none' : '';
+    const slidersGrid = document.querySelector('.vconfig-sliders-grid');
+    if (slidersGrid) slidersGrid.style.display = isXtts ? 'none' : '';
+    // Reload voices for the new provider
+    _selectedVoice = { voice_id: '', name: '' };
+    loadVoicesFromServer();
   });
 });
 
@@ -1394,6 +1570,24 @@ durOptions.forEach(opt => {
   });
 });
 
+// ── Custom script toggle ──
+function toggleCustomScript() {
+  const checked = document.getElementById('useCustomScript').checked;
+  document.getElementById('customScriptGroup').style.display = checked ? '' : 'none';
+}
+
+// Word count for custom script textarea
+document.addEventListener('DOMContentLoaded', () => {
+  const ta = document.getElementById('customScriptText');
+  const wc = document.getElementById('customScriptWordCount');
+  if (ta && wc) {
+    ta.addEventListener('input', () => {
+      const words = ta.value.trim() ? ta.value.trim().split(/\s+/).length : 0;
+      wc.textContent = words;
+    });
+  }
+});
+
 async function submitNewVideo(event) {
   event.preventDefault();
   const btn = document.getElementById('submitBtn');
@@ -1416,14 +1610,26 @@ async function submitNewVideo(event) {
     collection = _selectedCollection || 'general';
   }
 
+  // Custom script: if checkbox is checked and textarea has content, send it
+  const useCustom = document.getElementById('useCustomScript')?.checked;
+  const customText = document.getElementById('customScriptText')?.value?.trim() || null;
+  const custom_script = (useCustom && customText) ? customText : null;
+
+  // Video pipeline (animated mode only)
+  const video_pipeline = mode === 'animated'
+    ? (document.querySelector('input[name="video_pipeline"]:checked')?.value || 'default')
+    : 'default';
+
   const payload = {
     title: document.getElementById('title').value.trim(),
     mode,
     video_type,
     duration,
     collection,
+    video_pipeline,
     reference_character: mode === 'animated' ? document.getElementById('referenceCharacter').value.trim() || null : null,
     reference_transcripts,
+    custom_script,
   };
 
   try {
@@ -1441,6 +1647,9 @@ async function submitNewVideo(event) {
     modeOptions[0].click(); // reset to animated
     typeOptions[0].click(); // reset to top10
     durOptions[0].click();  // reset to 6-8 min
+    // Reset pipeline selector to default
+    pipelineOptions.forEach(o => o.classList.remove('active'));
+    if (pipelineOptions[0]) pipelineOptions[0].classList.add('active');
     // Reset reference videos
     referenceVideos.length = 0;
     renderReferenceList();
@@ -1512,6 +1721,26 @@ async function regenerateImageGenaipro(chunkNumber) {
     pollInterval = setInterval(() => refreshDetail(currentProjectId), 3000);
   } catch (e) {
     showToast('Error al regenerar: ' + e.message, 'error');
+    btn.disabled = false;
+    btn.textContent = origText;
+  }
+}
+
+async function regenerateVideoVeo(chunkNumber) {
+  if (!currentProjectId) return;
+  const btn = event.target;
+  const origText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '⏳';
+
+  try {
+    await apiFetch(`/api/projects/${currentProjectId}/scenes/${chunkNumber}/regenerate-veo`, { method: 'POST' });
+    showToast(`🎬 Regenerando video de escena #${chunkNumber} con Veo 3.1 Fast…`, 'info');
+    stopPolling();
+    await refreshDetail(currentProjectId);
+    pollInterval = setInterval(() => refreshDetail(currentProjectId), 5000);
+  } catch (e) {
+    showToast('Error al regenerar video: ' + e.message, 'error');
     btn.disabled = false;
     btn.textContent = origText;
   }
@@ -1717,6 +1946,48 @@ async function regenerateAllGenaipro() {
   } catch (e) {
     showToast('Error: ' + e.message, 'error');
     if (btn) { btn.disabled = false; btn.textContent = origText; }
+  }
+}
+
+async function generateMissingImages() {
+  if (!currentProjectId) return;
+  const btn = document.getElementById('genMissingImages');
+  const origText = btn ? btn.textContent : '🖼️ Generar imágenes faltantes';
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Generando faltantes…'; }
+
+  try {
+    await apiFetch(`/api/projects/${currentProjectId}/generate-missing-images`, { method: 'POST' });
+    showToast(`🖼️ Generando solo imágenes faltantes con ${_imgProviderName()} en segundo plano.`, 'info');
+    stopPolling();
+    await refreshDetail(currentProjectId);
+    pollInterval = setInterval(() => refreshDetail(currentProjectId), 3000);
+  } catch (e) {
+    showToast('Error: ' + e.message, 'error');
+    if (btn) { btn.disabled = false; btn.textContent = origText; }
+  }
+}
+
+// ── Visual Style (per-project text style) ─────────────────────────────────
+async function saveVisualStyle() {
+  if (!currentProjectId) return;
+  const input = document.getElementById('visualStyleInput');
+  const status = document.getElementById('visualStyleStatus');
+  const value = (input?.value || '').trim();
+  try {
+    if (status) { status.textContent = 'Guardando...'; status.style.color = '#aaa'; }
+    const res = await fetch(`/api/projects/${currentProjectId}/visual-style`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ visual_style: value })
+    });
+    const data = await res.json();
+    if (data.ok) {
+      if (status) { status.textContent = '✓ Guardado'; status.style.color = '#4a6'; setTimeout(() => { status.textContent = ''; }, 3000); }
+    } else {
+      if (status) { status.textContent = 'Error'; status.style.color = '#e55'; }
+    }
+  } catch (e) {
+    if (status) { status.textContent = 'Error al guardar'; status.style.color = '#e55'; }
   }
 }
 
@@ -2132,10 +2403,14 @@ async function initVoiceConfig() {
 
 async function loadVoicesFromServer() {
   try {
+    const provider = _getSelectedTtsProvider();
+    const apiKey = provider === 'xtts'
+      ? (document.getElementById('xttsServerUrl')?.value || 'http://192.168.1.41:7861')
+      : '';
     const data = await apiFetch('/api/tts/voices', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ tts_provider: 'genaipro', tts_api_key: '' }),
+      body: JSON.stringify({ tts_provider: provider, tts_api_key: apiKey }),
     });
     const raw = data.voices || [];
     _allVoices = raw.map(normalizeVoice);
@@ -2662,7 +2937,13 @@ function resetFilters() {
 }
 
 // ── Voice config collection ────────────────────────────────────────────────
+function _getSelectedTtsProvider() {
+  const checked = document.querySelector('input[name="tts_provider_select"]:checked');
+  return checked ? checked.value : 'genaipro';
+}
+
 function _collectVoiceConfig() {
+  const provider = _getSelectedTtsProvider();
   const modelId  = document.getElementById('ttsModelId')?.value  || 'eleven_multilingual_v2';
   const speed    = parseFloat(document.getElementById('ttsSpeed')?.value    || '1.0');
   const stability = parseFloat(document.getElementById('ttsStability')?.value || '0.5');
@@ -2671,6 +2952,18 @@ function _collectVoiceConfig() {
 
   const extraConfig = { model_id: modelId, speed, stability, similarity, style };
   if (_selectedVoice.name) extraConfig['voice_name'] = _selectedVoice.name;
+
+  if (provider === 'xtts') {
+    const serverUrl = document.getElementById('xttsServerUrl')?.value || 'http://192.168.1.41:7861';
+    extraConfig['server_url'] = serverUrl;
+    extraConfig['lang'] = 'en';
+    return {
+      tts_provider:  'xtts',
+      tts_api_key:   serverUrl,
+      tts_voice_id:  _selectedVoice.voice_id || null,
+      tts_config:    JSON.stringify(extraConfig),
+    };
+  }
 
   return {
     tts_provider:  'genaipro',
@@ -2935,6 +3228,25 @@ async function generateImages() {
 
 async function continueWithVideo() {
   showToast('Próximamente — integración con NCA para renderizado de video.', 'info');
+}
+
+async function generateVideosVeo(projectId) {
+  if (!projectId) return;
+
+  const btn = document.getElementById('generateVeoBtn');
+  const origText = btn ? btn.textContent : '🎬 Generar Videos con Veo';
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Iniciando Google Veo…'; }
+
+  try {
+    await apiFetch(`/api/projects/${projectId}/generate-videos-veo`, { method: 'POST' });
+    showToast('🎬 Google Veo iniciado — generando video por escena. Revisa los logs.', 'info');
+    stopPolling();
+    await refreshDetail(projectId);
+    pollInterval = setInterval(() => refreshDetail(projectId), 3000);
+  } catch (e) {
+    showToast('Error al generar videos con Veo: ' + e.message, 'error');
+    if (btn) { btn.disabled = false; btn.textContent = origText; }
+  }
 }
 
 async function searchStockAssets() {

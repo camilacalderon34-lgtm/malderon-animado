@@ -16,6 +16,8 @@ class ProjectCreate(BaseModel):
     reference_transcripts: Optional[str] = None  # JSON string of [{url, title, transcript}]
     target_chunk_size: int = 1500
     collection: Optional[str] = "general"
+    custom_script: Optional[str] = None  # User-provided script (skips AI generation)
+    video_pipeline: Optional[str] = "default"  # "default" or "veo"
 
 
 class ChunkOut(BaseModel):
@@ -55,6 +57,7 @@ class ProjectOut(BaseModel):
     video_type: Optional[str]
     duration: Optional[str]
     reference_character: Optional[str]
+    character_anchor: Optional[str] = None
     reference_character_path: Optional[str] = None
     reference_style_path: Optional[str] = None
     script: Optional[str]
@@ -71,6 +74,8 @@ class ProjectOut(BaseModel):
     preview_path: Optional[str] = None
     preview_progress: int = 0
     render_progress: int = 0
+    visual_style: Optional[str] = None
+    video_pipeline: Optional[str] = "default"
     collection: Optional[str] = "general"
     created_at: datetime
     updated_at: datetime
@@ -88,6 +93,7 @@ class ProjectListItem(BaseModel):
     status: ProjectStatus
     created_at: datetime
     updated_at: datetime
+    video_pipeline: Optional[str] = "default"
     chunk_count: int = 0
     chunks_done: int = 0
 

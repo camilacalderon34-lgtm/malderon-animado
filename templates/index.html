@@ -200,11 +200,55 @@
               </div>
             </div>
 
+            <!-- ── Video Pipeline sub-selector (solo modo Animado) ── -->
+            <div class="form-group" id="pipelineGroup">
+              <label>Pipeline de video <span class="optional">(solo modo Animado)</span></label>
+              <div class="mode-selector">
+                <label class="pipeline-option active" id="pipelineDefault">
+                  <input type="radio" name="video_pipeline" value="default" checked />
+                  <div class="mode-card">
+                    <div class="mode-icon">🎨</div>
+                    <div class="mode-title">Imagen + Animacion</div>
+                    <div class="mode-desc">
+                      Genera imagenes con IA, luego anima con Meta AI. Gratis
+                    </div>
+                  </div>
+                </label>
+                <label class="pipeline-option" id="pipelineVeo">
+                  <input type="radio" name="video_pipeline" value="veo" />
+                  <div class="mode-card">
+                    <div class="mode-icon">🎬</div>
+                    <div class="mode-title">Google Veo</div>
+                    <div class="mode-desc">
+                      Genera video directo desde texto. Mas rapido (~$2/video)
+                    </div>
+                  </div>
+                </label>
+              </div>
+            </div>
+
             <div class="form-group" id="characterGroup">
               <label>Personaje / Estilo de referencia <span class="optional">(opcional, solo modo
                   Animado)</span></label>
               <input type="text" id="referenceCharacter"
                 placeholder="Ej: cartoon style, anime, photorealistic, pixar style" />
+            </div>
+
+            <!-- ── Custom Script Toggle ──────────────────────────────── -->
+            <div class="form-group">
+              <label class="custom-script-toggle">
+                <input type="checkbox" id="useCustomScript" onchange="toggleCustomScript()" />
+                Ya tengo mi guion (saltar generacion con IA)
+              </label>
+            </div>
+            <div class="form-group" id="customScriptGroup" style="display:none;">
+              <label>Pega tu guion aqui *</label>
+              <textarea id="customScriptText" rows="10"
+                placeholder="Pega aqui el texto completo de tu guion/narración. Este texto se usara directamente para generar la voz."
+                style="width:100%;resize:vertical;min-height:150px;font-family:inherit;font-size:0.95rem;padding:10px;border-radius:8px;border:1px solid var(--border);background:var(--surface);color:var(--text);"></textarea>
+              <div style="margin-top:4px;font-size:0.8rem;color:var(--text-secondary);">
+                Palabras: <span id="customScriptWordCount">0</span>
+              </div>
             </div>
 
             <div class="form-actions">
@@ -295,6 +339,33 @@
           </div>
 
           <div class="voice-config-body">
+
+            <!-- TTS Provider selector -->
+            <div class="vconfig-group">
+              <label class="vconfig-label">Proveedor TTS</label>
+              <div class="mode-selector" style="margin-bottom:12px;">
+                <label class="pipeline-option active" id="ttsProviderGenaipro">
+                  <input type="radio" name="tts_provider_select" value="genaipro" checked />
+                  <div class="mode-card" style="padding:10px 12px;">
+                    <div class="mode-title" style="font-size:13px;">GenAIPro</div>
+                    <div class="mode-desc">Voces en la nube</div>
+                  </div>
+                </label>
+                <label class="pipeline-option" id="ttsProviderXtts">
+                  <input type="radio" name="tts_provider_select" value="xtts" />
+                  <div class="mode-card" style="padding:10px 12px;">
+                    <div class="mode-title" style="font-size:13px;">XTTS Local</div>
+                    <div class="mode-desc">Tu servidor GPU</div>
+                  </div>
+                </label>
+              </div>
+            </div>
+
+            <!-- XTTS server URL (hidden by default, shown when xtts selected) -->
+            <div class="vconfig-group" id="xttsServerGroup" style="display:none;">
+              <label class="vconfig-label">Servidor XTTS</label>
+              <input type="text" id="xttsServerUrl" class="form-input" value="http://192.168.1.41:7861" placeholder="http://192.168.1.41:7861" />
+            </div>
 
             <!-- Voice selector card -->
             <div class="vconfig-group">
@@ -447,6 +518,20 @@
 
           <!-- ── Animated mode controls ── -->
           <div id="animatedModeControls">
+            <!-- Visual Style text field -->
+            <div class="ref-section" id="visualStyleSection">
+              <div class="ref-section-label">
+                Estilo Visual
+                <span class="ref-section-hint">describe el estilo de las imagenes generadas</span>
+              </div>
+              <textarea id="visualStyleInput" class="visual-style-input" rows="3"
+                placeholder="Ej: Ancient Babylon 600 BCE. Mud-brick ziggurats, Ishtar Gate blue glazed tiles. Workers in kaunakes tunics. King Nebuchadnezzar in gold tiara. Warm desert tones, golden hour, cinematic."></textarea>
+              <div style="display:flex;align-items:center;gap:10px;margin-top:6px;">
+                <button class="btn btn-sm" onclick="saveVisualStyle()" style="background:#4a6;color:#fff;padding:4px 14px;border:none;border-radius:4px;cursor:pointer;">Guardar Estilo</button>
+                <span class="visual-style-status" id="visualStyleStatus"></span>
+              </div>
+            </div>
+
             <!-- Reference images: two upload cards side by side -->
             <div id="referenceImagesSection" class="ref-section">
               <div class="ref-section-label">
@@ -505,6 +590,18 @@
             <p class="scenes-ready-hint" id="scenesReadyHint">
               Genera un prompt visual por escena, luego el proveedor creara la imagen (16:9).
             </p>
+
+            <!-- Veo Pipeline: generate videos directly from text -->
+            <div id="veoPipelineSection" class="animate-section" style="display:none">
+              <div class="animate-section-header">
+                <h3>🎬 Google Veo — Video Directo</h3>
+                <span id="veoProgress" class="animate-progress-label"></span>
+              </div>
+              <p class="scenes-ready-hint">Genera video directamente desde el texto de cada escena con Google Veo. No requiere imagenes previas.</p>
+              <button class="btn btn-primary btn-lg" id="generateVeoBtn" onclick="generateVideosVeo(currentProjectId)">
+                🎬 Generar Videos con Veo
+              </button>
+            </div>
 
             <!-- Animation section -->
             <div id="veo3AnimationSection" class="animate-section" style="display:none">
@@ -743,6 +840,15 @@
                 <button class="btn btn-ghost btn-sm" onclick="testGenaIproImage()" title="Diagnóstico: prueba /veo/create-image con tu clave">🔍 Test imagen</button>
               </div>
               <div id="genaipro-test-result" style="display:none;margin-top:8px;padding:8px;background:#1a1a1a;border-radius:4px;font-size:12px;white-space:pre-wrap;max-height:300px;overflow-y:auto;"></div>
+            </div>
+
+            <div class="settings-field">
+              <label class="settings-label">GeminiGen.AI (Veo 3.1)</label>
+              <div class="settings-key-row">
+                <input type="password" id="setting_geminigen_api_key" class="settings-input"
+                  placeholder="API key de GeminiGen.AI" autocomplete="off" />
+                <button class="btn btn-ghost btn-sm" onclick="saveSetting('geminigen_api_key')">Guardar</button>
+              </div>
             </div>
 
             <div class="settings-field">

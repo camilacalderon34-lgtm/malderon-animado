@@ -13,6 +13,7 @@ router = APIRouter(prefix="/api/settings", tags=["settings"])
 _API_KEY_KEYS = {
     "anthropic_api_key",
     "genaipro_api_key",
+    "geminigen_api_key",
     "pollinations_api_key",
     "wavespeed_api_key",
     "google_api_key",

@@ -16,7 +16,7 @@ from ..database import get_db
 from ..models import Project, Chunk, ProjectStatus, AppSetting
 from ..schemas import ProjectCreate, ProjectOut, ProjectListItem, ScriptApprovalPayload, ResplitPayload, VoiceConfigPayload
 from ..config import PROJECTS_PATH, settings as app_settings
-from ..services.pipeline_service import start_pipeline, start_pipeline_phase2, start_regenerate_script, start_generate_voiceover, start_pipeline_phase3, start_create_scenes_from_srt, start_generate_images, start_stock_asset_search, start_retry_chunk_image, start_generate_motion_prompts, start_animate_scenes, start_regenerate_image_genaipro, start_regenerate_all_genaipro, start_plan_scenes, start_recalibrate_timestamps
+from ..services.pipeline_service import start_pipeline, start_pipeline_phase2, start_regenerate_script, start_generate_voiceover, start_pipeline_phase3, start_create_scenes_from_srt, start_generate_images, start_stock_asset_search, start_retry_chunk_image, start_generate_motion_prompts, start_animate_scenes, start_regenerate_image_genaipro, start_regenerate_all_genaipro, start_generate_missing_images, start_plan_scenes, start_recalibrate_timestamps, start_generate_videos_veo, start_regenerate_video_veo, start_regenerate_video_grok
 from ..services.render_service import start_render_final, render_transition_preview, start_preview_render
 from pydantic import BaseModel
 
@@ -98,8 +98,10 @@ def create_project(payload: ProjectCreate, db: Session = Depends(get_db)):
         duration=payload.duration,
         reference_character=payload.reference_character,
         reference_transcripts=payload.reference_transcripts,
+        custom_script=payload.custom_script,
         target_chunk_size=payload.target_chunk_size,
         collection=payload.collection or "general",
+        video_pipeline=payload.video_pipeline or "default",
         status=ProjectStatus.queued,
         created_at=datetime.utcnow(),
         updated_at=datetime.utcnow(),
@@ -751,6 +753,24 @@ def generate_images(project_id: int, db: Session = Depends(get_db)):
     return project
 
 
+@router.post("/{project_id}/generate-videos-veo", response_model=ProjectOut)
+def generate_videos_veo(project_id: int, db: Session = Depends(get_db)):
+    """Generate videos directly from text using Google Veo (no images needed)."""
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if project.status not in (ProjectStatus.scenes_ready, ProjectStatus.videos_ready, ProjectStatus.error):
+        raise HTTPException(status_code=400, detail="El proyecto no está en un estado válido para generar videos con Veo")
+
+    project.status = ProjectStatus.generating_videos
+    project.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(project)
+
+    start_generate_videos_veo(project.id)
+    return project
+
+
 @router.post("/{project_id}/search-stock-assets", response_model=ProjectOut)
 def search_stock_assets(project_id: int, db: Session = Depends(get_db)):
     """Analyze scenes and search/download stock footage assets."""
@@ -1023,6 +1043,54 @@ def regenerate_scene_image_genaipro(project_id: int, chunk_number: int, db: Sess
     return project
 
 
+@router.post("/{project_id}/scenes/{chunk_number}/regenerate-veo", response_model=ProjectOut)
+def regenerate_scene_video_veo(project_id: int, chunk_number: int, db: Session = Depends(get_db)):
+    """Re-generate the video for one scene using GeminiGen.AI Veo 3.1 Fast."""
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    chunk = (
+        db.query(Chunk)
+        .filter(Chunk.project_id == project_id, Chunk.chunk_number == chunk_number)
+        .first()
+    )
+    if not chunk:
+        raise HTTPException(status_code=404, detail=f"Chunk {chunk_number} no encontrado")
+    if not (chunk.image_prompt or chunk.scene_text):
+        raise HTTPException(
+            status_code=400,
+            detail="Esta escena no tiene prompt visual ni narración. Genera los prompts primero."
+        )
+
+    start_regenerate_video_veo(project_id, chunk_number)
+    return project
+
+
+@router.post("/{project_id}/scenes/{chunk_number}/regenerate-grok", response_model=ProjectOut)
+def regenerate_scene_video_grok(project_id: int, chunk_number: int, db: Session = Depends(get_db)):
+    """Re-generate the video for one scene using Grok 3 via GeminiGen.AI."""
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    chunk = (
+        db.query(Chunk)
+        .filter(Chunk.project_id == project_id, Chunk.chunk_number == chunk_number)
+        .first()
+    )
+    if not chunk:
+        raise HTTPException(status_code=404, detail=f"Chunk {chunk_number} no encontrado")
+    if not (chunk.image_prompt or chunk.scene_text):
+        raise HTTPException(
+            status_code=400,
+            detail="Esta escena no tiene prompt visual ni narración. Genera los prompts primero."
+        )
+
+    start_regenerate_video_grok(project_id, chunk_number)
+    return project
+
+
 @router.post("/{project_id}/regenerate-all-genaipro", response_model=ProjectOut)
 def regenerate_all_images_genaipro(project_id: int, db: Session = Depends(get_db)):
     """Re-generate images for ALL scenes that have an image_prompt using Genaipro Veo."""
@@ -1031,6 +1099,17 @@ def regenerate_all_images_genaipro(project_id: int, db: Session = Depends(get_db
         raise HTTPException(status_code=404, detail="Project not found")
 
     start_regenerate_all_genaipro(project_id)
+    return project
+
+
+@router.post("/{project_id}/generate-missing-images", response_model=ProjectOut)
+def generate_missing_images(project_id: int, db: Session = Depends(get_db)):
+    """Generate images ONLY for scenes that don't have one yet."""
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    start_generate_missing_images(project_id)
     return project
 
 
@@ -1189,7 +1268,8 @@ def render_final_video(project_id: int, db: Session = Depends(get_db)):
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
     if project.status not in (
-        ProjectStatus.images_ready, ProjectStatus.done, ProjectStatus.error,
+        ProjectStatus.images_ready, ProjectStatus.videos_ready,
+        ProjectStatus.done, ProjectStatus.error,
         ProjectStatus.rendering, ProjectStatus.queued,
     ):
         raise HTTPException(
@@ -1467,4 +1547,52 @@ def get_reference_style(project_id: int, db: Session = Depends(get_db)):
     if not ref.exists():
         raise HTTPException(status_code=404, detail="Archivo no encontrado")
     return FileResponse(str(ref), media_type="image/jpeg")
+
+
+# ── Visual Style (per-project text style for image prompts) ───────────────────
+
+class _VisualStylePayload(BaseModel):
+    visual_style: str = ""
+
+@router.put("/{project_id}/visual-style")
+def update_visual_style(project_id: int, payload: _VisualStylePayload, db: Session = Depends(get_db)):
+    """Save or update the visual style text for a project."""
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Proyecto no encontrado")
+    project.visual_style = payload.visual_style.strip() or None
+    db.commit()
+    return {"ok": True, "visual_style": project.visual_style}
+
+
+@router.get("/{project_id}/visual-style")
+def get_visual_style(project_id: int, db: Session = Depends(get_db)):
+    """Return just the visual_style text for a project."""
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Proyecto no encontrado")
+    return {"visual_style": project.visual_style}
+
+
+class _CharacterAnchorPayload(BaseModel):
+    character_anchor: str = ""
+
+@router.put("/{project_id}/character-anchor")
+def update_character_anchor(project_id: int, payload: _CharacterAnchorPayload, db: Session = Depends(get_db)):
+    """Save or update the character anchor text for a project."""
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Proyecto no encontrado")
+    project.character_anchor = payload.character_anchor.strip() or None
+    db.commit()
+    return {"ok": True, "character_anchor": project.character_anchor}
+
+
+@router.get("/{project_id}/character-anchor")
+def get_character_anchor(project_id: int, db: Session = Depends(get_db)):
+    """Return just the character_anchor text for a project."""
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Proyecto no encontrado")
+    return {"character_anchor": project.character_anchor}
 

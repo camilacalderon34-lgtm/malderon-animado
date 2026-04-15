@@ -19,12 +19,14 @@ from .base import TTSProvider
 from .genaipro import GenAIProTTS
 from .elevenlabs import ElevenLabsTTS
 from .openai_tts import OpenAITTS
+from .xtts import XTTTS
 
 # Registry: provider_name → class
 PROVIDERS: dict[str, type[TTSProvider]] = {
     "genaipro":   GenAIProTTS,
     "elevenlabs": ElevenLabsTTS,
     "openai":     OpenAITTS,
+    "xtts":       XTTTS,
 }
 
 
@@ -37,4 +39,4 @@ def get_provider(name: str, api_key: str, config: dict) -> TTSProvider:
     return cls(api_key=api_key, config=config)
 
 
-__all__ = ["TTSProvider", "GenAIProTTS", "ElevenLabsTTS", "OpenAITTS", "PROVIDERS", "get_provider"]
+__all__ = ["TTSProvider", "GenAIProTTS", "ElevenLabsTTS", "OpenAITTS", "XTTTS", "PROVIDERS", "get_provider"]

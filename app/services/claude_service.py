@@ -1,14 +1,13 @@
 """AI service - script generation, image prompts, keyword extraction.
-Uses Anthropic SDK directly with Claude models.
+Uses OpenRouter (OpenAI-compatible) for all AI calls.
 """
 import json
 import re
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional
-from anthropic import Anthropic
+from openai import OpenAI as _OpenAI
 from ..config import settings
-
 
 # ── Numbered entry detection (for countdown/list videos) ─────────────────────
 # Matches: "Number 1,", "Number 10.", "Number one.", "#1 ", "#10:", "10. ", "1. ", etc.
@@ -55,46 +54,28 @@ def _safe_print(msg: str) -> None:
     except Exception:
         pass
 
-# Anthropic SDK (unused now, kept for reference)
-# client = Anthropic(api_key=settings.anthropic_api_key)
-
-# OpenRouter client for fast API calls (scene division)
-from openai import OpenAI as _OpenAI
+# OpenRouter client (OpenAI-compatible)
 _openrouter = _OpenAI(
     api_key=settings.openrouter_api_key,
     base_url="https://openrouter.ai/api/v1",
 )
 
-
-# Model aliases
-_MODEL_FAST  = "claude-haiku-4-5-20251001"  # cheap + fast (JSON tasks, image prompts)
-_MODEL_SMART = "claude-sonnet-4-5"              # quality (scripts, editing)
+# Model aliases (OpenRouter format) — using Gemini for cost efficiency
+_MODEL_FAST  = "google/gemini-2.0-flash-lite-001"     # cheap + fast (JSON tasks, image prompts)
+_MODEL_SMART = "google/gemini-2.5-flash"              # quality (scripts, editing)
 
 
 def _chat(system: str, user: str, model: str = _MODEL_SMART, max_tokens: int = 8192) -> str:
-    """Call Claude via OpenRouter API (fast, no subprocess overhead).
-
-    Falls back to Claude CLI stdin if OpenRouter fails.
-    Model mapping: claude-sonnet-4-5 → anthropic/claude-sonnet-4-5
-                   claude-haiku-4-5-... → anthropic/claude-haiku-4-5-20251001
-    """
-    # Map model aliases to OpenRouter format
-    _model_map = {
-        "claude-sonnet-4-5": "anthropic/claude-sonnet-4-5",
-        "claude-haiku-4-5-20251001": "anthropic/claude-haiku-4-5-20251001",
-    }
-    or_model = _model_map.get(model, f"anthropic/{model}")
-
+    """Call AI via OpenRouter API."""
     for attempt in range(1, 4):
         try:
             resp = _openrouter.chat.completions.create(
-                model=or_model,
+                model=model,
                 max_tokens=max_tokens,
                 messages=[
                     {"role": "system", "content": system},
                     {"role": "user", "content": user},
                 ],
-                timeout=180,
             )
             text = resp.choices[0].message.content
             if not text or not text.strip():
@@ -103,7 +84,7 @@ def _chat(system: str, user: str, model: str = _MODEL_SMART, max_tokens: int = 8
         except Exception as e:
             _safe_print(f"[OpenRouter] Error attempt {attempt}/3: {str(e)[:200]}")
             import time; time.sleep(2)
-    raise RuntimeError("OpenRouter failed after 3 attempts")
+    raise RuntimeError("OpenRouter API failed after 3 attempts")
 
 # ── Root path (two levels up from this file: app/services/ → root) ────────────
 _ROOT = Path(__file__).resolve().parent.parent.parent
@@ -232,27 +213,58 @@ RETURN ONLY THE NARRATION SCRIPT. Clean flowing text, no markers, no scene numbe
 
 # ── Image prompt generation ────────────────────────────────────────────────────
 
-IMAGE_PROMPT_SYSTEM = """You are a visual prompt engineer for cinematic AI image generation.
-Create detailed, photorealistic image prompts for documentary-style YouTube videos.
+def _build_image_system_prompt(style: str = "") -> str:
+    """Build a system prompt adapted to the project's visual style."""
+    if not style:
+        style = "cinematic, photorealistic"
 
-CRITICAL RULES:
-- Cinematic style: dark moody lighting, rich color grading, deep shadows, warm highlights.
-- Camera: professional documentary cinematography (wide shots, medium close-ups, aerials).
-- Lighting: dramatic natural light, golden hour, volumetric fog, rim lighting.
-- NO people, NO characters, NO faces, NO human figures.
-- Focus on: landscapes, architecture, objects, environments, aerial views, macro details.
-- 16:9 widescreen. No text, no watermarks, no logos.
+    return f"""You are a visual prompt engineer for cinematic biblical AI image generation.
+Create detailed image prompts for YouTube videos in this style: {style}
+
+=== MANDATORY VISUAL STYLE (apply to EVERY prompt) ===
+- PHOTOREALISTIC biblical cinema, like "The Chosen" TV series or Ridley Scott's "Exodus"
+- Color palette: warm earth tones (ochre, sienna, gold, bronze), deep shadows, golden hour lighting
+- Textures: weathered stone, rough linen/wool fabrics, clay pottery, dusty sandstone
+- People MUST wear period-accurate ancient Middle Eastern clothing: linen tunics, woolen cloaks, leather sandals, head coverings
+- Architecture: mud-brick walls, stone columns, wooden beams, oil lamps, torch-lit interiors
+- Lighting: dramatic chiaroscuro — warm oil lamp glow indoors, golden sunset/sunrise outdoors, god-rays through windows or clouds
+- Camera: cinematic 16:9 widescreen, shallow depth of field, film grain
+
+=== SCENE VARIETY (rotate between these) ===
+1. PEOPLE SCENES: biblical figures interacting, crowds in marketplaces, workers building, soldiers, priests, families
+2. CITY/ARCHITECTURE: ancient cities (Babylon, Jerusalem, Egypt), massive walls, temples, ziggurats, gates, aqueducts
+3. LANDSCAPE: desert valleys, olive groves, rivers (Euphrates, Jordan), mountains at sunset, starry night skies
+4. INTERIOR: stone rooms lit by oil lamps, workshops, throne rooms, synagogues, caves with warm light
+5. CLOSE-UPS: hands working clay/stone, ancient scrolls, herbs/spices, bread, wine, tools, weapons
+6. DRAMATIC: storms, fire, divine light breaking through clouds, armies, processions
+
+=== RULES ===
+- NEVER repeat the same composition or subject type twice in a row
+- VARY camera angles: wide establishing, medium two-shot, close-up portrait, overhead, low-angle dramatic
+- Every prompt MUST include people unless it's specifically a landscape or object close-up
+- NO text, watermarks, logos, modern elements
+- NO generic "old man preparing herbs" — each scene must be UNIQUE and specific to the narration
+
 Return ONLY valid JSON - no markdown fences, no extra text."""
 
-IMAGE_PROMPT_TEMPLATE = """Create a detailed cinematic image prompt for this video scene:
+IMAGE_PROMPT_TEMPLATE = """Create a unique cinematic biblical image prompt that SPECIFICALLY illustrates this narration:
 
-Scene narration: {narration}
-Visual description: {visual_description}
-Style reference: {reference_character}
+Narration: {narration}
+Visual context: {visual_description}
+Style: {reference_character}
+
+IMPORTANT: The image must directly depict what the narration describes.
+Analyze the narration carefully and create a scene that a viewer would immediately connect to these words.
+
+STYLE LOCK: Photorealistic biblical cinema. Ancient Middle East. Warm earth tones. Dramatic lighting.
+- People in linen tunics, woolen cloaks, leather sandals
+- Stone/mud-brick architecture, oil lamps, torches
+- Golden hour or chiaroscuro lighting
+- Cinematic camera angles, shallow depth of field
 
 Return JSON:
 {{
-  "image_prompt": "Detailed cinematic prompt. Include: subject, composition, lighting (dramatic/moody), camera angle/lens, color palette, mood, textures. NO people. Comma-separated descriptive terms."
+  "image_prompt": "Photorealistic biblical cinema scene: WHO (specific biblical-era people with clothing details), WHERE (specific ancient location with architectural details), WHAT action, CAMERA (angle and framing), LIGHTING (golden hour/oil lamp/dramatic shadows). Warm earth tones, film grain, 16:9 widescreen."
 }}"""
 
 KEYWORDS_SYSTEM = """You are a stock footage search specialist.
@@ -281,12 +293,14 @@ def _extract_json(text: str) -> dict:
 def generate_image_prompt(
     narration: str, visual_description: str, reference_character: str = ""
 ) -> str:
+    style = reference_character or "cinematic, photorealistic"
+    system = _build_image_system_prompt(style)
     prompt = IMAGE_PROMPT_TEMPLATE.format(
         narration=narration,
         visual_description=visual_description,
-        reference_character=reference_character or "cinematic, photorealistic",
+        reference_character=style,
     )
-    return _extract_json(_chat(IMAGE_PROMPT_SYSTEM, prompt, model=_MODEL_FAST, max_tokens=512))["image_prompt"]
+    return _extract_json(_chat(system, prompt, model=_MODEL_FAST, max_tokens=512))["image_prompt"]
 
 
 def generate_search_keywords(narration: str, visual_description: str) -> Dict:
@@ -406,7 +420,7 @@ def generate_script_from_outline(outline: str, duration: str = "6-8") -> str:
 
 # ── Scene division with SRT timestamps ───────────────────────────────────────
 
-_MODEL_SCENE_DIVISION = "anthropic/claude-sonnet-4-5"  # Sonnet via OpenRouter
+_MODEL_SCENE_DIVISION = "google/gemini-2.5-flash"  # Gemini via OpenRouter
 _SCENE_CHUNK_WORDS = 3000  # split script into chunks of this many words for long videos
 
 
@@ -621,7 +635,48 @@ def _fix_title_separators(scenes: list, original_script: str) -> list:
     return scenes
 
 
-def divide_script_into_scenes(_script_text: str, srt_content: str, mode: str = "animated") -> list:
+def _merge_short_scenes_by_timestamp(scenes: list, min_dur_ms: int = 6000, max_dur_ms: int = 8000) -> list:
+    """Merge scenes shorter than min_dur_ms using actual startMs/endMs timestamps.
+
+    Only merges if the combined duration stays <= max_dur_ms (strict 8s cap).
+    If no merge is possible without exceeding max, the scene stays as-is.
+    """
+    for _pass in range(50):
+        merged_any = False
+        for i, s in enumerate(scenes):
+            dur = s["endMs"] - s["startMs"]
+            if dur >= min_dur_ms:
+                continue
+
+            # Try merge backward
+            if i > 0:
+                prev_dur = scenes[i - 1]["endMs"] - scenes[i - 1]["startMs"]
+                if prev_dur + dur <= max_dur_ms:
+                    scenes[i - 1]["texto"] = scenes[i - 1]["texto"].rstrip() + " " + s["texto"].lstrip()
+                    scenes[i - 1]["endMs"] = s["endMs"]
+                    scenes.pop(i)
+                    merged_any = True
+                    break
+
+            # Try merge forward
+            if i + 1 < len(scenes):
+                next_dur = scenes[i + 1]["endMs"] - scenes[i + 1]["startMs"]
+                if next_dur + dur <= max_dur_ms:
+                    scenes[i + 1]["texto"] = s["texto"].rstrip() + " " + scenes[i + 1]["texto"].lstrip()
+                    scenes[i + 1]["startMs"] = s["startMs"]
+                    scenes.pop(i)
+                    merged_any = True
+                    break
+
+            # Can't merge without exceeding 8s — leave as-is
+
+        if not merged_any:
+            break
+
+    return scenes
+
+
+def divide_script_into_scenes(_script_text: str, srt_content: str, mode: str = "animated", video_pipeline: str = "default") -> list:
     """Divide a script into scenes using Claude Haiku + word-level SRT timestamps.
 
     Approach:
@@ -650,9 +705,9 @@ def divide_script_into_scenes(_script_text: str, srt_content: str, mode: str = "
 
     if total_words <= _SCENE_CHUNK_WORDS:
         # Short video — process everything in one call
-        scene_texts = _divide_text_with_haiku(full_text, total_duration_s, wps, mode)
+        scene_texts = _divide_text_with_haiku(full_text, total_duration_s, wps, mode, video_pipeline)
         _safe_print(f"[SceneDivision] Haiku devolvió {len(scene_texts)} escenas (un solo bloque)")
-        scene_texts = _postprocess_scenes(scene_texts, wps, mode)
+        scene_texts = _postprocess_scenes(scene_texts, wps, mode, video_pipeline)
         all_scenes = _map_scenes_to_timestamps(scene_texts, word_ts)
     else:
         # Long video — split SRT into ~60s blocks, process each, merge
@@ -674,8 +729,8 @@ def divide_script_into_scenes(_script_text: str, srt_content: str, mode: str = "
             block_words = len(block_text.split())
             block_wps = block_words / block_dur_s if block_dur_s > 0 else wps
 
-            block_scene_texts = _divide_text_with_haiku(block_text, block_dur_s, block_wps, mode)
-            block_scene_texts = _postprocess_scenes(block_scene_texts, block_wps, mode)
+            block_scene_texts = _divide_text_with_haiku(block_text, block_dur_s, block_wps, mode, video_pipeline)
+            block_scene_texts = _postprocess_scenes(block_scene_texts, block_wps, mode, video_pipeline)
             block_scenes = _map_scenes_to_timestamps(block_scene_texts, block_word_ts)
             all_scenes.extend(block_scenes)
 
@@ -692,6 +747,12 @@ def divide_script_into_scenes(_script_text: str, srt_content: str, mode: str = "
 
     # ── Second pass: split titles that now have periods inserted ─────
     all_scenes = _force_split_numbered_titles_with_ts(all_scenes)
+
+    # ── Veo pipeline: merge short scenes using REAL timestamps ────────
+    # Strict 6-8s. Only merge if result stays <= 8s. 5s scenes are acceptable.
+    if video_pipeline == "veo":
+        all_scenes = _merge_short_scenes_by_timestamp(all_scenes, min_dur_ms=6000, max_dur_ms=8000)
+        _safe_print(f"[SceneDivision] After Veo merge (6-8s): {len(all_scenes)} escenas.")
 
     # Renumber IDs sequentially
     for idx, s in enumerate(all_scenes, 1):
@@ -827,14 +888,14 @@ def _build_word_timestamps(entries: list) -> list:
 
 
 def _divide_text_with_haiku(full_text: str, total_duration_s: float, wps: float,
-                            mode: str = "animated") -> list:
+                            mode: str = "animated", video_pipeline: str = "default") -> list:
     """Send continuous narration text to Claude Sonnet (OpenRouter). Returns list of scene text strings."""
     total_words = len(full_text.split())
-    print(f"[SceneDivision] model={_MODEL_SCENE_DIVISION} (OpenRouter), mode={mode}, words={total_words}, dur={total_duration_s:.1f}s")
+    print(f"[SceneDivision] model={_MODEL_SCENE_DIVISION} (OpenRouter), mode={mode}, pipeline={video_pipeline}, words={total_words}, dur={total_duration_s:.1f}s")
     print(f"[SceneDivision] STOCK PROMPT: {'YES' if mode == 'stock' else 'NO (animated)'}")
 
-    target_min_s = 4
-    target_max_s = 7
+    target_min_s = 6 if video_pipeline == "veo" else 4
+    target_max_s = 8 if video_pipeline == "veo" else 7
     words_min = max(3, int(target_min_s * wps))
     words_max = int(target_max_s * wps)
 
@@ -916,6 +977,37 @@ def _divide_text_with_haiku(full_text: str, total_duration_s: float, wps: float,
             "Do not omit, add, or repeat any text.\n"
             '["scene 1 text", "scene 2 text", ...]'
         )
+    elif video_pipeline == "veo":
+        # Veo pipeline — scenes must be 6-8 seconds (Veo generates 8s clips)
+        target_min, target_max, abs_max = 6, 8, 8
+        user_prompt = (
+            f"Dividí este texto narrado en escenas visuales para un video.\n\n"
+            f"TEXTO COMPLETO:\n{full_text}\n\n"
+            f"DURACIÓN TOTAL: {total_duration_s:.1f}s\n"
+            f"TOTAL PALABRAS: {total_words}\n"
+            f"VELOCIDAD: {wps:.1f} palabras por segundo\n\n"
+            "=== REGLAS ===\n"
+            f"1. Cada escena debe durar entre {target_min} y {target_max} segundos.\n"
+            f"   (A {wps:.1f} palabras/segundo, eso es ~{int(target_min * wps)}-{int(target_max * wps)} palabras por escena)\n"
+            f"2. MÍNIMO ABSOLUTO: {target_min} segundos. NUNCA crear escenas menores a {int(target_min * wps)} palabras.\n"
+            f"3. MÁXIMO ABSOLUTO: {abs_max} segundos. NUNCA superar {int(abs_max * wps)} palabras por escena.\n"
+            "4. NUNCA cortes a mitad de frase o palabra.\n"
+            "5. Cortá preferentemente en puntos (.), signos de exclamación (!) o signos de interrogación (?).\n"
+            f"6. Si una oración dura más de {target_max} segundos, DEBÉS dividirla en un punto medio natural como una coma "
+            "entre cláusulas.\n"
+            f"7. Si dos frases cortas consecutivas duran menos de {target_min} segundos cada una, DEBÉS agruparlas en una sola escena.\n"
+            "8. Cada escena debe representar UNA idea visual completa.\n"
+            "9. Es preferible tener escenas de 7-8 segundos que escenas de 2-3 segundos. Agrupa texto corto.\n\n"
+            "=== REGLA PARA LISTAS NUMERADAS ===\n"
+            "Si el script contiene números (Number 1, Number 2, #1, etc.):\n"
+            "- El NÚMERO + TÍTULO + PRIMERA ORACIÓN deben ser UNA SOLA ESCENA.\n"
+            "- NUNCA crees una escena con SOLO el número.\n"
+            "- NUNCA elimines los números del texto.\n\n"
+            "=== OUTPUT ===\n"
+            "Devolvé SOLO el JSON array de strings. "
+            "Todo el texto original debe estar presente, sin omitir ni repetir nada.\n"
+            "[\"texto escena 1\", \"texto escena 2\", ...]"
+        )
     else:
         # Animated mode — original prompt
         target_min, target_max, abs_max = 3, 5, 6
@@ -967,16 +1059,8 @@ def _divide_text_with_haiku(full_text: str, total_duration_s: float, wps: float,
     print(f"[SceneDivision] Prompt has visual-coherence rules: {_has_visual_rules}")
     print(f"[SceneDivision] Prompt first 300 chars: {user_prompt[:300]}")
 
-    _safe_print(f"[SceneDivision] Calling Sonnet via OpenRouter...")
-    resp = _openrouter.chat.completions.create(
-        model="anthropic/claude-sonnet-4-5",
-        max_tokens=16000,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-    )
-    raw = resp.choices[0].message.content
+    _safe_print(f"[SceneDivision] Calling Gemini via OpenRouter...")
+    raw = _chat(system_prompt, user_prompt, model=_MODEL_SCENE_DIVISION, max_tokens=16000)
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
     # Extract only the JSON array (Sonnet sometimes adds text after the array)
@@ -1051,14 +1135,73 @@ def _force_split_numbered_titles(scene_texts: list) -> list:
     return result
 
 
-def _postprocess_scenes(scene_texts: list, wps: float, mode: str = "animated") -> list:
+def _merge_short_duration_scenes(scenes: list, wps: float, min_dur: float, max_dur: float) -> list:
+    """Merge scenes shorter than min_dur into their neighbors (by duration, not word count).
+
+    Used for Veo pipeline where each video clip is 8s — scenes under 6s waste the clip.
+    Merges into the shorter neighbor, respecting max_dur to avoid creating oversized scenes.
+    """
+    for _pass in range(10):
+        changed = False
+        result = []
+        i = 0
+        while i < len(scenes):
+            text = scenes[i]
+            dur = len(text.split()) / wps
+            if dur < min_dur and len(scenes) > 1:
+                # Try to merge with the shorter neighbor
+                prev_dur = len(result[-1].split()) / wps if result else 999
+                next_dur = len(scenes[i + 1].split()) / wps if i + 1 < len(scenes) else 999
+
+                # Merge backward if combined doesn't exceed max
+                if result and prev_dur <= next_dur and (prev_dur + dur) <= max_dur:
+                    result[-1] = result[-1].rstrip() + " " + text.lstrip()
+                    changed = True
+                    i += 1
+                    continue
+                # Merge forward if combined doesn't exceed max
+                if i + 1 < len(scenes) and (next_dur + dur) <= max_dur:
+                    scenes[i + 1] = text.rstrip() + " " + scenes[i + 1].lstrip()
+                    changed = True
+                    i += 1
+                    continue
+                # If neither fits under max, merge with the shorter one anyway
+                if result and prev_dur <= next_dur:
+                    result[-1] = result[-1].rstrip() + " " + text.lstrip()
+                    changed = True
+                    i += 1
+                    continue
+                if i + 1 < len(scenes):
+                    scenes[i + 1] = text.rstrip() + " " + scenes[i + 1].lstrip()
+                    changed = True
+                    i += 1
+                    continue
+            result.append(text)
+            i += 1
+        scenes = result
+        if not changed:
+            break
+    return scenes
+
+
+def _postprocess_scenes(scene_texts: list, wps: float, mode: str = "animated", video_pipeline: str = "default") -> list:
     """Post-process scene texts: merge short, split long, validate.
 
     Runs merge→split→merge cycles until all scenes are 4+ words and within max duration.
     Numbered entries (Number X, #X) get a relaxed max duration to avoid bad splits.
     """
-    MAX_DUR = 7.0 if mode == "stock" else 6.0
-    NUMBERED_MAX_DUR = 15.0 if mode == "stock" else 12.0
+    if video_pipeline == "veo":
+        MAX_DUR = 8.0
+        MIN_DUR = 6.0           # Veo generates 8s clips — scenes < 6s waste video
+        NUMBERED_MAX_DUR = 15.0
+    elif mode == "stock":
+        MAX_DUR = 7.0
+        MIN_DUR = 0.0           # no minimum for stock
+        NUMBERED_MAX_DUR = 15.0
+    else:
+        MAX_DUR = 6.0           # default: Pollinations+Meta AI (DO NOT CHANGE)
+        MIN_DUR = 0.0
+        NUMBERED_MAX_DUR = 12.0
     min_words = 4
 
     def _effective_max(text):
@@ -1072,6 +1215,10 @@ def _postprocess_scenes(scene_texts: list, wps: float, mode: str = "animated") -
     for _cycle in range(10):
         # ── MERGE: absorb any scene with <4 words into its neighbor ──────
         scenes = _merge_short_scenes(scenes, min_words)
+
+        # ── MERGE BY DURATION: merge scenes shorter than MIN_DUR ─────────
+        if MIN_DUR > 0:
+            scenes = _merge_short_duration_scenes(scenes, wps, MIN_DUR, MAX_DUR)
 
         # ── SPLIT: break any scene exceeding its max duration ────────────
         scenes = _split_long_scenes(scenes, wps, MAX_DUR, min_words,

@@ -83,3 +83,4 @@ static/test_video.html
 
 # Cookies / credentials
 youtube_cookies.txt
+flow_session/

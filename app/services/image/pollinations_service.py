@@ -2,10 +2,9 @@
 Pollinations.ai image generation service.
 
 Models:
-  - klein-large (FLUX.2 Klein 9B): When reference image(s) exist — supports image input
-    for character/style consistency. FREE. Reference images are uploaded to catbox.moe
-    to obtain a public URL that Pollinations can access.
-  - flux: Default free model when no reference images are available.
+  - flux: Free model used for all image generation. Supports optional reference
+    image input via the `image` query parameter for style consistency.
+    Reference images are uploaded to catbox.moe to obtain a public URL.
 
 API key: POLLINATIONS_API_KEY in .env or Settings.
 """
@@ -93,7 +92,7 @@ def _generate_with_reference(
     width: int,
     height: int,
 ) -> None:
-    """Generate using klein-large model with reference image(s)."""
+    """Generate using flux model with reference image(s)."""
     # Upload reference image(s) to get public URLs
     primary_ref = char_ref or style_ref
     ref_url = _upload_to_catbox(primary_ref)
@@ -112,12 +111,12 @@ def _generate_with_reference(
     parts.append(prompt)
     full_prompt = " ".join(parts)
 
-    print(f"[Pollinations] klein-large with ref — prompt: {full_prompt[:120]}...")
+    print(f"[Pollinations] zimage with ref — prompt: {full_prompt[:120]}...")
 
     encoded_prompt = quote(full_prompt)
     url = f"https://gen.pollinations.ai/image/{encoded_prompt}"
     params = {
-        "model": "klein-large",
+        "model": "zimage",
         "image": ref_url,
         "width": width,
         "height": height,
@@ -131,13 +130,13 @@ def _generate_with_reference(
 
     if len(resp.content) < 1000:
         raise RuntimeError(
-            f"Pollinations klein-large: respuesta muy pequena ({len(resp.content)} bytes). "
+            f"Pollinations zimage: respuesta muy pequena ({len(resp.content)} bytes). "
             f"Prompt: {prompt[:120]}"
         )
 
     output_path.write_bytes(resp.content)
     print(
-        f"[Pollinations] klein-large Guardada: {output_path.name} "
+        f"[Pollinations] zimage+ref Guardada: {output_path.name} "
         f"({len(resp.content):,} bytes)"
     )
 
@@ -156,9 +155,9 @@ def _generate_with_flux(
     params = {
         "width": width,
         "height": height,
-        "model": "flux",
+        "model": "zimage",
         "nologo": "true",
-        "enhance": "true",
+        "enhance": "false",
     }
     if api_key:
         params["key"] = api_key
@@ -168,12 +167,12 @@ def _generate_with_flux(
 
     if len(resp.content) < 1000:
         raise RuntimeError(
-            f"Pollinations flux: respuesta muy pequena ({len(resp.content)} bytes). "
+            f"Pollinations zimage: respuesta muy pequena ({len(resp.content)} bytes). "
             f"Prompt: {prompt[:120]}"
         )
 
     output_path.write_bytes(resp.content)
     print(
-        f"[Pollinations] flux Guardada: {output_path.name} "
+        f"[Pollinations] zimage Guardada: {output_path.name} "
         f"({len(resp.content):,} bytes)"
     )

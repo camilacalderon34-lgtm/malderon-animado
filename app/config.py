@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     nca_api_key: str = ""
     google_api_key: str = ""
     genaipro_api_key: str = ""   # Used for TTS and video animation
+    geminigen_api_key: str = ""  # GeminiGen.AI API key (Veo 3.1 video generation)
     pollinations_api_key: str = ""  # Free image generation via Pollinations.ai
     wavespeed_api_key: str = ""    # WaveSpeed.ai images + animation
     image_provider: str = "pollinations"  # "pollinations" or "wavespeed"

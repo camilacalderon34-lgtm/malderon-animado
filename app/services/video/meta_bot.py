@@ -6,11 +6,30 @@ Meta AI actively detects headless browsers, so we always run in headful mode.
 
 Uses SYNC Playwright API (Python 3.14 on Windows breaks async subprocess).
 """
+import asyncio
 import shutil
+import sys
 import time
 import threading
+import multiprocessing
 from pathlib import Path
 from playwright.sync_api import sync_playwright
+
+
+def _ensure_event_loop():
+    """Ensure a working asyncio event loop exists in the current thread.
+
+    On Windows, Playwright needs a ProactorEventLoop to spawn browser
+    subprocesses. When running inside a daemon thread (e.g. from uvicorn),
+    asyncio may not have a loop or may have one that doesn't support
+    subprocess_exec. This forces a fresh ProactorEventLoop.
+    """
+    if sys.platform == "win32":
+        try:
+            loop = asyncio.ProactorEventLoop()
+            asyncio.set_event_loop(loop)
+        except Exception:
+            pass
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
@@ -59,6 +78,7 @@ def setup_meta_login():
     META_SESSION_DIR.mkdir(parents=True, exist_ok=True)
     print(f"[META] Session directory: {META_SESSION_DIR}")
 
+    _ensure_event_loop()
     with sync_playwright() as p:
         ctx = p.chromium.launch_persistent_context(
             user_data_dir=str(META_SESSION_DIR),
@@ -293,17 +313,17 @@ def _animate_in_page(page, image_path: str, motion_prompt: str,
     print(f"{tag} Navigating to meta.ai...")
     page.goto(
         "https://www.meta.ai/",
-        wait_until="networkidle",
+        wait_until="domcontentloaded",
         timeout=NAV_TIMEOUT,
     )
-    time.sleep(3)
+    time.sleep(1)
 
     # Step 1: Attach image
     attached = _attach_image(page, image_path)
     if not attached:
         scr = _save_debug_screenshot(page, output_path, "no_attach")
         raise RuntimeError(f"Could not attach image. Debug: {scr}")
-    time.sleep(2)
+    time.sleep(1)
 
     # Step 2: Fill prompt
     textarea = _find_textarea(page)
@@ -318,11 +338,10 @@ def _animate_in_page(page, image_path: str, motion_prompt: str,
     )
     textarea.click()
     textarea.fill(full_prompt)
-    time.sleep(1)
+    time.sleep(0.5)
 
     # Count existing video elements BEFORE submitting
     existing_video_count = page.locator("video").count()
-    print(f"{tag} Existing videos before submit: {existing_video_count}")
 
     textarea.press("Enter")
     print(f"{tag} Prompt sent: {full_prompt[:80]}...")
@@ -341,7 +360,7 @@ def _animate_in_page(page, image_path: str, motion_prompt: str,
                 break
         except Exception:
             pass
-        time.sleep(5)
+        time.sleep(2)
 
     if not video_el:
         scr = _save_debug_screenshot(page, output_path, "no_video")
@@ -349,7 +368,7 @@ def _animate_in_page(page, image_path: str, motion_prompt: str,
             f"No video after {GENERATION_TIMEOUT // 1000}s. Debug: {scr}"
         )
 
-    time.sleep(5)
+    time.sleep(2)
 
     # Step 4: Download
     _download_video(page, video_el, output_path)
@@ -370,6 +389,7 @@ def animate_scene(image_path: str, motion_prompt: str, output_path: str,
 
     tag = f"[META-W{worker_id}]"
 
+    _ensure_event_loop()
     with sync_playwright() as p:
         ctx = p.chromium.launch_persistent_context(
             user_data_dir=str(session_dir),
@@ -392,79 +412,100 @@ def _worker_loop(worker_id: int, tasks: list, results: list, total: int,
                  lock: threading.Lock, on_scene_done=None):
     """
     Single worker thread: opens ONE browser, processes tasks from shared list.
+    Resilient: if browser launch fails, worker exits silently without killing others.
+    If a task fails with browser-closed error, worker stops taking new tasks.
     """
+    # Stagger browser launches to avoid Playwright race conditions
+    time.sleep(worker_id * 2)
+
     tag = f"[META-W{worker_id}]"
     session_dir = _worker_session_dir(worker_id)
     if not session_dir.exists():
         print(f"{tag} Session dir not found: {session_dir}, skipping worker.")
         return
 
-    with sync_playwright() as p:
-        ctx = p.chromium.launch_persistent_context(
+    print(f"{tag} Launching Chromium...")
+    try:
+        _ensure_event_loop()
+        pw = sync_playwright().start()
+        ctx = pw.chromium.launch_persistent_context(
             user_data_dir=str(session_dir),
             headless=False,
             args=_BROWSER_ARGS,
             viewport={"width": 1280, "height": 800},
         )
-        page = ctx.pages[0] if ctx.pages else ctx.new_page()
-        page.set_default_timeout(ELEMENT_TIMEOUT)
+    except Exception as exc:
+        print(f"{tag} FAILED to launch browser: {exc}")
+        return
 
-        try:
-            while True:
-                # Grab next task from shared list
+    page = ctx.pages[0] if ctx.pages else ctx.new_page()
+    page.set_default_timeout(ELEMENT_TIMEOUT)
+
+    try:
+        while True:
+            with lock:
+                if not tasks:
+                    break
+                item = tasks.pop(0)
+            chunk_number, image_path, motion_prompt, output_path = item
+            try:
+                print(f"{tag} Starting scene #{chunk_number}...")
+                _animate_in_page(page, image_path, motion_prompt,
+                                 output_path, tag)
                 with lock:
-                    if not tasks:
-                        break
-                    item = tasks.pop(0)
-                chunk_number, image_path, motion_prompt, output_path = item
-                try:
-                    print(f"{tag} Starting scene #{chunk_number}...")
-                    _animate_in_page(page, image_path, motion_prompt,
-                                     output_path, tag)
-                    with lock:
-                        results.append((chunk_number, None))
-                    if on_scene_done:
-                        on_scene_done(chunk_number, None)
-                    done = sum(1 for _, e in results if e is None)
-                    print(f"{tag} Scene #{chunk_number} done ({done}/{total})")
-                except Exception as exc:
-                    with lock:
-                        results.append((chunk_number, str(exc)))
-                    if on_scene_done:
-                        on_scene_done(chunk_number, str(exc))
-                    print(f"{tag} Scene #{chunk_number} FAILED: {exc}")
-        finally:
-            print(f"{tag} All tasks done, closing browser.")
+                    results.append((chunk_number, None))
+                if on_scene_done:
+                    on_scene_done(chunk_number, None)
+                done = sum(1 for _, e in results if e is None)
+                print(f"{tag} Scene #{chunk_number} done ({done}/{total})")
+            except Exception as exc:
+                err_msg = str(exc)
+                with lock:
+                    results.append((chunk_number, err_msg))
+                if on_scene_done:
+                    on_scene_done(chunk_number, err_msg)
+                print(f"{tag} Scene #{chunk_number} FAILED: {exc}")
+                # If browser died, stop this worker (don't consume more tasks)
+                if "closed" in err_msg.lower() or "crashed" in err_msg.lower():
+                    print(f"{tag} Browser appears dead, stopping worker.")
+                    break
+    finally:
+        print(f"{tag} All tasks done, closing browser.")
+        try:
             ctx.close()
+            pw.stop()
+        except Exception:
+            pass
 
 
 def animate_batch(tasks_input: list[tuple], num_workers: int = 5,
                   on_scene_done=None):
     """
-    Animate multiple scenes in parallel using N browser worker threads.
-    Each worker opens ONE browser and reuses it for all its scenes.
+    Animate scenes using multiple parallel browser workers.
+
+    Each worker gets its own cloned session directory and processes tasks
+    from a shared list. Workers run in threads, each with its own browser.
 
     tasks_input: list of (chunk_number, image_path, motion_prompt, output_path)
     on_scene_done: optional callback(chunk_number, error_or_None) called after each scene
     Returns: list of (chunk_number, error_or_None)
     """
+    num_workers = min(num_workers, len(tasks_input))
     prepare_parallel_sessions(num_workers)
 
-    # Shared mutable list + lock for thread-safe task distribution
-    task_list = list(tasks_input)
+    tasks = list(tasks_input)
     results: list[tuple[int, str | None]] = []
-    total = len(task_list)
+    total = len(tasks_input)
     lock = threading.Lock()
 
     threads = []
-    for i in range(num_workers):
+    for wid in range(num_workers):
         t = threading.Thread(
             target=_worker_loop,
-            args=(i, task_list, results, total, lock, on_scene_done),
-            daemon=True,
+            args=(wid, tasks, results, total, lock, on_scene_done),
         )
-        threads.append(t)
         t.start()
+        threads.append(t)
 
     for t in threads:
         t.join()

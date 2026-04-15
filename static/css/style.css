@@ -264,10 +264,17 @@ html, body { height: 100%; font-family: 'Inter', system-ui, sans-serif; backgrou
   background: var(--bg3);
 }
 .mode-option.active .mode-card,
-.mode-option input:checked ~ .mode-card {
+.mode-option input:checked ~ .mode-card,
+.pipeline-option.active .mode-card,
+.pipeline-option input:checked ~ .mode-card {
   border-color: var(--accent);
   background: rgba(108,99,255,0.1);
 }
+.pipeline-option {
+  flex: 1;
+  cursor: pointer;
+}
+.pipeline-option input[type="radio"] { display: none; }
 .mode-icon { font-size: 30px; margin-bottom: 8px; }
 .mode-title { font-size: 14px; font-weight: 700; margin-bottom: 4px; }
 .mode-desc { font-size: 12px; color: var(--text2); }
@@ -1935,6 +1942,35 @@ html, body { height: 100%; font-family: 'Inter', system-ui, sans-serif; backgrou
   max-width: 520px;
   min-width: 360px;
 }
+.visual-style-input {
+  width: 100%;
+  padding: 10px 12px;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text1);
+  font-size: 13px;
+  font-family: inherit;
+  resize: vertical;
+  min-height: 60px;
+  transition: border-color var(--transition);
+}
+.visual-style-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.visual-style-input::placeholder {
+  color: var(--text3);
+  font-size: 12px;
+}
+.visual-style-status {
+  font-size: 11px;
+  color: var(--text3);
+  margin-top: 4px;
+  text-align: right;
+  min-height: 16px;
+}
+
 .ref-section-label {
   font-size: 13px;
   font-weight: 600;

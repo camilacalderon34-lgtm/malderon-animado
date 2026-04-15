@@ -106,6 +106,17 @@ def init_db():
             except Exception:
                 pass  # column already exists
 
+        # Migrate: visual_style and video_pipeline for per-project settings
+        for col_def in (
+            "ALTER TABLE projects ADD COLUMN visual_style TEXT",
+            "ALTER TABLE projects ADD COLUMN video_pipeline VARCHAR(50) DEFAULT 'default'",
+        ):
+            try:
+                conn.execute(__import__("sqlalchemy").text(col_def))
+                conn.commit()
+            except Exception:
+                pass  # column already exists
+
         # Migrate: ensure settings table exists (created by Base.metadata.create_all above,
         # but add explicit guard for existing DBs that may not have run create_all again)
         try:
